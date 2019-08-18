@@ -1,5 +1,13 @@
 package mapreduce
 
+import (
+	"encoding/json"
+	"log"
+	"os"
+	"sort"
+	"strconv"
+)
+
 func doReduce(
 	jobName string, // the name of the whole MapReduce job
 	reduceTask int, // which reduce task this is
@@ -44,4 +52,46 @@ func doReduce(
 	//
 	// Your code here (Part I).
 	//
+	decs := make([]json.Decoder, nMap)
+	for mapTask := 0; mapTask < nMap; mapTask++ {
+		file, err := os.Open(reduceName(jobName, mapTask, reduceTask))
+		if err != nil {
+			log.Fatal("reduce open intermediate file error:", err)
+		}
+		defer file.Close()
+
+		decs[mapTask] = *json.NewDecoder(file)
+	}
+
+	kvMap := make(map[string][]string)
+	for _, dec := range decs {
+		for {
+			kv := KeyValue{"", ""}
+			err := dec.Decode(&kv)
+			if err != nil {
+				break
+			}
+			kvMap[kv.Key] = append(kvMap[kv.Key], kv.Value)
+		}
+	}
+
+	ofile, err := os.Create(outFile)
+	if err != nil {
+		log.Fatal("reduce open out file error:", err)
+	}
+	enc := json.NewEncoder(ofile)
+
+	keys := make([]int, len(kvMap))
+	var index int
+	for k, _ := range kvMap {
+		aint, _ := strconv.Atoi(k)
+		keys[index] = aint
+		index++
+	}
+	sort.Ints(keys)
+	for _, k := range keys {
+		kstr := strconv.Itoa(k)
+		enc.Encode(&KeyValue{kstr, reduceF(kstr, kvMap[kstr])})
+	}
+	ofile.Close()
 }
