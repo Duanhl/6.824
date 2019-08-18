@@ -5,7 +5,6 @@ import (
 	"log"
 	"os"
 	"sort"
-	"strconv"
 )
 
 func doReduce(
@@ -52,7 +51,8 @@ func doReduce(
 	//
 	// Your code here (Part I).
 	//
-	decs := make([]json.Decoder, nMap)
+
+	kvMap := make(map[string][]string)
 	for mapTask := 0; mapTask < nMap; mapTask++ {
 		file, err := os.Open(reduceName(jobName, mapTask, reduceTask))
 		if err != nil {
@@ -60,11 +60,7 @@ func doReduce(
 		}
 		defer file.Close()
 
-		decs[mapTask] = *json.NewDecoder(file)
-	}
-
-	kvMap := make(map[string][]string)
-	for _, dec := range decs {
+		dec := *json.NewDecoder(file)
 		for {
 			kv := KeyValue{"", ""}
 			err := dec.Decode(&kv)
@@ -79,19 +75,26 @@ func doReduce(
 	if err != nil {
 		log.Fatal("reduce open out file error:", err)
 	}
+	defer ofile.Close()
 	enc := json.NewEncoder(ofile)
 
-	keys := make([]int, len(kvMap))
-	var index int
+	// partI需要按键的数值进行排序
+	//var keys []int
+	//for k, _ := range kvMap {
+	//	aint, _ := strconv.Atoi(k)
+	//	keys = append(keys, aint)
+	//}
+	//sort.Ints(keys)
+
+	var keys []string
 	for k, _ := range kvMap {
-		aint, _ := strconv.Atoi(k)
-		keys[index] = aint
-		index++
+		keys = append(keys, k)
 	}
-	sort.Ints(keys)
+	sort.Strings(keys)
+
 	for _, k := range keys {
-		kstr := strconv.Itoa(k)
+		//kstr := strconv.Itoa(k)
+		kstr := k
 		enc.Encode(&KeyValue{kstr, reduceF(kstr, kvMap[kstr])})
 	}
-	ofile.Close()
 }
