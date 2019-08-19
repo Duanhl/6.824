@@ -18,11 +18,15 @@ import (
 //
 func mapF(filename string, contents string) []mapreduce.KeyValue {
 	var kvs []mapreduce.KeyValue
-	words := strings.FieldsFunc(contents, unicode.IsLetter)
+	words := strings.FieldsFunc(contents, isNotLetter)
 	for _, word := range words {
 		kvs = append(kvs, mapreduce.KeyValue{word, ""})
 	}
 	return kvs
+}
+
+func isNotLetter(r rune) bool {
+	return !unicode.IsLetter(r)
 }
 
 //
