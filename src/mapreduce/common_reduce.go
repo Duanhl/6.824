@@ -1,5 +1,12 @@
 package mapreduce
 
+import (
+	"encoding/json"
+	"log"
+	"os"
+	"sort"
+)
+
 func doReduce(
 	jobName string, // the name of the whole MapReduce job
 	reduceTask int, // which reduce task this is
@@ -44,4 +51,50 @@ func doReduce(
 	//
 	// Your code here (Part I).
 	//
+
+	kvMap := make(map[string][]string)
+	for mapTask := 0; mapTask < nMap; mapTask++ {
+		file, err := os.Open(reduceName(jobName, mapTask, reduceTask))
+		if err != nil {
+			log.Fatal("reduce open intermediate file error:", err)
+		}
+		defer file.Close()
+
+		dec := *json.NewDecoder(file)
+		for {
+			kv := KeyValue{"", ""}
+			err := dec.Decode(&kv)
+			if err != nil {
+				break
+			}
+			kvMap[kv.Key] = append(kvMap[kv.Key], kv.Value)
+		}
+	}
+
+	ofile, err := os.Create(outFile)
+	if err != nil {
+		log.Fatal("reduce open out file error:", err)
+	}
+	defer ofile.Close()
+	enc := json.NewEncoder(ofile)
+
+	// partI需要按键的数值进行排序
+	//var keys []int
+	//for k, _ := range kvMap {
+	//	aint, _ := strconv.Atoi(k)
+	//	keys = append(keys, aint)
+	//}
+	//sort.Ints(keys)
+
+	var keys []string
+	for k, _ := range kvMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		//kstr := strconv.Itoa(k)
+		kstr := k
+		enc.Encode(&KeyValue{kstr, reduceF(kstr, kvMap[kstr])})
+	}
 }
