@@ -17,16 +17,21 @@ import (
 // of key/value pairs.
 //
 func mapF(filename string, contents string) []mapreduce.KeyValue {
+	isNotLetter := func(r rune) bool {
+		return !unicode.IsLetter(r)
+	}
+
+	wcMap := make(map[string]int)
+	for _, word := range strings.FieldsFunc(contents, isNotLetter) {
+		//lower := strings.ToLower(word)
+		wcMap[word] = wcMap[word] + 1
+	}
+
 	var kvs []mapreduce.KeyValue
-	words := strings.FieldsFunc(contents, isNotLetter)
-	for _, word := range words {
-		kvs = append(kvs, mapreduce.KeyValue{word, ""})
+	for k, v := range wcMap {
+		kvs = append(kvs, mapreduce.KeyValue{k, strconv.Itoa(v)})
 	}
 	return kvs
-}
-
-func isNotLetter(r rune) bool {
-	return !unicode.IsLetter(r)
 }
 
 //
@@ -35,7 +40,15 @@ func isNotLetter(r rune) bool {
 // any map task.
 //
 func reduceF(key string, values []string) string {
-	return strconv.Itoa(len(values))
+	var sum int
+	for _, c := range values {
+		ci, err := strconv.Atoi(c)
+		if err != nil {
+			panic(err)
+		}
+		sum = ci + sum
+	}
+	return strconv.Itoa(sum)
 }
 
 // Can be run in 3 ways:

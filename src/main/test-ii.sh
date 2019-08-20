@@ -15,3 +15,5 @@ else
   echo "Passed test" > /dev/stderr
 fi
 
+rm -rf mrtmp*
+rm -rf diff.out
