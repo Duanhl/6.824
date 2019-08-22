@@ -38,7 +38,7 @@ func mapF(document string, value string) (res []mapreduce.KeyValue) {
 func reduceF(key string, values []string) string {
 	// Your code here (Part V).
 	sort.Strings(values)
-	return strconv.Itoa(len(values)) + " " + strings.Join(values, " ")
+	return strconv.Itoa(len(values)) + " " + strings.Join(values, ",")
 }
 
 // Can be run in 3 ways:
