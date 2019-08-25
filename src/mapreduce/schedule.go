@@ -2,6 +2,7 @@ package mapreduce
 
 import (
 	"fmt"
+	"sync"
 )
 
 //
@@ -33,35 +34,45 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	// Your code here (Part III, Part IV).
 	//
 
-	var idx int
-	for worker := range registerChan {
-
-		if idx >= len(mapFiles) {
-			break
-		}
-
-		var file string
-		if phase == mapPhase {
-			file = mapFiles[idx]
-		} else {
-			file = ""
-		}
-		doTaskArgs := DoTaskArgs{
-			JobName:       jobName,
-			File:          file,
-			Phase:         phase,
-			TaskNumber:    idx,
-			NumOtherPhase: n_other,
-		}
-
-		go func() {
-			ok := call(worker, "Worker.DoTask", &doTaskArgs, new(struct{}))
-			if ok {
-				registerChan <- worker //执行完任务归队
+	var doTask int
+	var wg sync.WaitGroup
+loop:
+	for {
+		select {
+		case worker := <-registerChan:
+			if doTask == ntasks {
+				break loop
 			}
-		}()
 
-		idx++
+			var file string
+			if phase == mapPhase {
+				file = mapFiles[doTask]
+			} else {
+				file = ""
+			}
+
+			args := DoTaskArgs{
+				JobName:       jobName,
+				File:          file,
+				Phase:         phase,
+				TaskNumber:    doTask,
+				NumOtherPhase: n_other,
+			}
+
+			wg.Add(1)
+			go func() {
+				ok := call(worker, "Worker.DoTask", args, new(struct{}))
+				defer wg.Done()
+				if ok {
+					go func() {
+						registerChan <- worker
+					}()
+				}
+			}()
+			doTask++
+		}
 	}
+	wg.Wait()
+
 	fmt.Printf("Schedule: %v done\n", phase)
 }
