@@ -24,7 +24,7 @@ func mapF(filename string, contents string) []mapreduce.KeyValue {
 	wcMap := make(map[string]int)
 	for _, word := range strings.FieldsFunc(contents, isNotLetter) {
 		//lower := strings.ToLower(word)
-		wcMap[word] = wcMap[word] + 1
+		wcMap[word] += 1
 	}
 
 	var kvs []mapreduce.KeyValue

@@ -34,45 +34,41 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	// Your code here (Part III, Part IV).
 	//
 
-	var doTask int
 	var wg sync.WaitGroup
-loop:
-	for {
-		select {
-		case worker := <-registerChan:
-			if doTask == ntasks {
-				break loop
-			}
+	wg.Add(ntasks)
+	for idx := 0; idx < ntasks; idx++ {
+		go func(doTask int) {
+			for {
+				select {
+				case worker := <-registerChan:
+					file := ""
+					if phase == mapPhase {
+						file = mapFiles[doTask]
+					}
 
-			var file string
-			if phase == mapPhase {
-				file = mapFiles[doTask]
-			} else {
-				file = ""
-			}
+					args := DoTaskArgs{
+						JobName:       jobName,
+						File:          file,
+						Phase:         phase,
+						TaskNumber:    doTask,
+						NumOtherPhase: n_other,
+					}
 
-			args := DoTaskArgs{
-				JobName:       jobName,
-				File:          file,
-				Phase:         phase,
-				TaskNumber:    doTask,
-				NumOtherPhase: n_other,
-			}
-
-			wg.Add(1)
-			go func() {
-				ok := call(worker, "Worker.DoTask", args, new(struct{}))
-				defer wg.Done()
-				if ok {
-					go func() {
-						registerChan <- worker
-					}()
+					if call(worker, "Worker.DoTask", args, new(struct{})) {
+						go returnWorker(worker, registerChan)
+						wg.Done()
+						return
+					}
 				}
-			}()
-			doTask++
-		}
+			}
+		}(idx)
 	}
 	wg.Wait()
 
 	fmt.Printf("Schedule: %v done\n", phase)
+}
+
+// return available worker client
+func returnWorker(worker string, registerChan chan string) {
+	registerChan <- worker
 }

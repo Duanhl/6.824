@@ -22,7 +22,7 @@ func mapF(document string, value string) (res []mapreduce.KeyValue) {
 	}
 	stringSet := make(map[string]string)
 	for _, word := range strings.FieldsFunc(value, isNotLetter) {
-		stringSet[strings.ToLower(word)] = document
+		stringSet[word] = document
 
 	}
 
