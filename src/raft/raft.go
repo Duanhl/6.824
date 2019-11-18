@@ -21,7 +21,6 @@ import (
 	"labrpc"
 	"math/rand"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -313,24 +312,30 @@ func (rf *Raft) startElection() {
 		LastLogIndex: rf.commitIndex,
 		LastLogTerm:  rf.lastApplied,
 	}
-	var voteCount int32
+	var voteCount int
+
+	var wg sync.WaitGroup
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
+			wg.Add(1)
 			go func(server int, args *RequestVoteArgs) {
 				reply := &RequestVoteReply{}
 				if rf.sendRequestVote(server, voteArg, reply) {
 					if reply.VoteGranted {
-						atomic.AddInt32(&voteCount, 1)
+						DPrintf("term %v, server %v get vote from server %v", rf.currentTerm, rf.me, server)
+						voteCount += 1
+						//atomic.AddInt32(&voteCount, 1)
 					}
 				}
+				wg.Done()
 			}(i, voteArg)
 		}
 	}
 
-	count := atomic.LoadInt32(&voteCount)
-	count += 1
-	DPrintf("term: %v, server %v get %v votes", rf.currentTerm, rf.me, count)
-	if int(count) > len(rf.peers)/2 {
+	wg.Wait()
+	voteCount += 1
+	DPrintf("term: %v, server %v get %v votes", rf.currentTerm, rf.me, voteCount)
+	if int(voteCount) > len(rf.peers)/2 {
 		rf.state = Leader
 	}
 	for i := 0; i < len(rf.peers); i++ {
@@ -346,6 +351,14 @@ func (rf *Raft) startElection() {
 			go func(server int, args *AppendEntriesRequest) {
 				reply := &AppendEntriesReply{}
 				rf.sendAppendEntries(server, args, reply)
+				ticker := time.Tick(time.Duration(100) * time.Millisecond)
+				for {
+					select {
+					case <-ticker:
+						reply := &AppendEntriesReply{}
+						rf.sendAppendEntries(server, args, reply)
+					}
+				}
 			}(i, heatbeat)
 		}
 	}
