@@ -21,6 +21,7 @@ import (
 	"labrpc"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -53,7 +54,7 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	isLeader bool
+	state State
 
 	//persist states
 	currentTerm int
@@ -67,7 +68,17 @@ type Raft struct {
 	//leader
 	newIndex   []int
 	matchIndex []int
+
+	timer *time.Timer
 }
+
+type State string
+
+const (
+	Candidate State = "candidate"
+	Leader          = "leader"
+	Follower        = "follower"
+)
 
 // return currentTerm and whether this server
 // believes it is the leader.
@@ -78,7 +89,7 @@ func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 
 	term = rf.currentTerm
-	isLeader = rf.isLeader
+	isLeader = rf.state == Leader
 	return term, isLeader
 }
 
@@ -152,10 +163,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
+		return
+	}
 
-	} else {
-		rf.currentTerm = args.Term
+	if rf.votedFor == -1 {
 		rf.votedFor = args.CandidateId
+		rf.currentTerm = args.Term
 
 		reply.VoteGranted = true
 		reply.Term = rf.currentTerm
@@ -193,6 +206,34 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+//append entries rpc request
+type AppendEntriesRequest struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+
+	PrevLogTerm int
+	Entries     [][]byte
+
+	LeaderCommit int
+}
+
+//append entries rpc response
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+// handle append entries request
+func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesReply) {
+	rf.timer.Reset(time.Duration(150+rand.Intn(150)) * time.Millisecond)
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesRequest, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
@@ -253,37 +294,60 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	go func() {
-		timer := time.After(time.Duration(rand.Int() / 300))
-		for {
-			select {
-			case <-applyCh:
-				timer = time.After(time.Duration(rand.Int() / 300))
-				continue
-			case <-timer:
-				rf.mu.Lock()
-				rf.currentTerm += 1
-				voteArg := &RequestVoteArgs{
-					Term:         rf.currentTerm,
-					CandidateId:  rf.me,
-					LastLogIndex: rf.commitIndex,
-					LastLogTerm:  rf.lastApplied,
-				}
-				var voteReply *RequestVoteReply
-				var voteCount int
-				for i := 0; i < len(peers); i++ {
-					if i != rf.me {
-						rf.RequestVote(voteArg, voteReply)
-						if voteReply.VoteGranted {
-							voteCount += 1
-						} else {
-
-						}
-					}
-				}
-			}
-		}
-	}()
+	rf.votedFor = -1
+	rf.currentTerm = 0
+	initialTime := time.Duration(150+rand.Intn(150)) * time.Millisecond
+	rf.timer = time.AfterFunc(initialTime, rf.startElection)
 
 	return rf
+}
+
+func (rf *Raft) startElection() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.currentTerm += 1
+	voteArg := &RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: rf.commitIndex,
+		LastLogTerm:  rf.lastApplied,
+	}
+	var voteCount int32
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me {
+			go func(server int, args *RequestVoteArgs) {
+				reply := &RequestVoteReply{}
+				if rf.sendRequestVote(server, voteArg, reply) {
+					if reply.VoteGranted {
+						atomic.AddInt32(&voteCount, 1)
+					}
+				}
+			}(i, voteArg)
+		}
+	}
+
+	count := atomic.LoadInt32(&voteCount)
+	count += 1
+	DPrintf("term: %v, server %v get %v votes", rf.currentTerm, rf.me, count)
+	if int(count) > len(rf.peers)/2 {
+		rf.state = Leader
+	}
+	for i := 0; i < len(rf.peers); i++ {
+		heatbeat := &AppendEntriesRequest{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: 0,
+			PrevLogTerm:  0,
+			Entries:      nil,
+			LeaderCommit: 0,
+		}
+		if i != rf.me {
+			go func(server int, args *AppendEntriesRequest) {
+				reply := &AppendEntriesReply{}
+				rf.sendAppendEntries(server, args, reply)
+			}(i, heatbeat)
+		}
+	}
+	rf.timer.Stop()
 }
