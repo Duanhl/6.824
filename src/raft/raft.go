@@ -315,7 +315,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.ticker = time.NewTicker(time.Millisecond)
-	rf.electionTimeout = 200 + rand.Intn(100)
+	rf.electionTimeout = 150 + rand.Intn(150)
 	rf.heartbeatTimeout = 100 + rand.Intn(10)
 	rf.electionElapsed = 0
 	rf.heartbeatElapsed = 0
