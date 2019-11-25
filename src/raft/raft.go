@@ -357,13 +357,13 @@ func (rf *Raft) becomeFollower() {
 
 func (rf *Raft) becomeCandidate() {
 	rf.state = Candidate
-	rf.tick = rf.electionTick
 
 	rf.mu.Lock()
 	rf.currentTerm += 1
 	rf.preVotedFor = rf.me
 	rf.leader = -1
 	rf.mu.Unlock()
+	rf.tick = rf.electionTick
 
 	rf.election()
 }
@@ -371,7 +371,6 @@ func (rf *Raft) becomeCandidate() {
 func (rf *Raft) becomeLeader() {
 	rf.state = Leader
 	rf.tick = rf.heartbeatTick
-	rf.preVotedFor = -1
 	rf.leader = rf.me
 	rf.resetHeartbeat()
 }
@@ -401,6 +400,7 @@ func (rf *Raft) electionTick() {
 
 	if rf.electionElapsed > rf.electionTimeout {
 		rf.electionElapsed = 0
+		rf.electionTimeout = 150 + rand.Intn(150)
 		go rf.becomeCandidate()
 	}
 }
@@ -422,6 +422,7 @@ func (rf *Raft) heartbeatTick() {
 func (rf *Raft) election() {
 	DPrintf("server %v start election, term: %v", rf.me, rf.currentTerm)
 	voteChan := make(chan bool, 1)
+	followerChan := make(chan struct{}, 1)
 	voteArg := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
@@ -437,9 +438,13 @@ func (rf *Raft) election() {
 					if reply.VoteGranted {
 						DPrintf("term %v, server %v get vote from server %v", rf.currentTerm, rf.me, server)
 						voteChan <- true
+					} else if reply.Term > rf.currentTerm {
+						close(followerChan)
 					} else {
 						voteChan <- false
 					}
+				} else {
+					voteChan <- false
 				}
 			}(i, voteArg)
 		}
@@ -447,7 +452,7 @@ func (rf *Raft) election() {
 
 	myCount := 1
 	voteCount := 1
-loop:
+
 	for {
 		select {
 		case ok := <-voteChan:
@@ -455,17 +460,16 @@ loop:
 				myCount += 1
 			}
 			voteCount += 1
-			if rf.state == Follower {
-				break loop
-			}
 			if myCount == rf.quorum {
 				DPrintf("term %v, server %v become leader", rf.currentTerm, rf.me)
 				rf.becomeLeader()
-				break loop
+				return
 			}
 			if voteCount == len(rf.peers) {
-				break loop
+				return
 			}
+		case <-followerChan:
+			rf.becomeFollower()
 		}
 
 	}
