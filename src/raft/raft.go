@@ -271,12 +271,11 @@ const (
 )
 
 type ReplyMsg struct {
-	Type        ReplyType
-	Term        int
-	Success     bool
-	VoteGranted bool
-	Server      int
-	NextIndex   int
+	Type      ReplyType
+	Term      int
+	Success   bool
+	Server    int
+	NextIndex int
 }
 
 // handle append entries request
@@ -296,11 +295,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 	}
 
 	if args.PrevLogIndex > -1 && //$5.3 consistency check
-		(len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term == args.PrevLogTerm) {
+		(len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
+
+	rf.resetElect()
 
 	conflictSrc, conflictDest := -1, -1 //$5.3 conflict check
 	for j := 0; j < len(args.Entries); j++ {
@@ -319,16 +320,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 	}
 
 	if args.LeaderCommit > rf.commitIndex {
-		if args.LeaderCommit > args.Entries[len(args.Entries)-1].LogIndex {
-			rf.commitIndex = args.Entries[len(args.Entries)-1].LogIndex
+		var lastEntry *LogEntry
+		if args.Entries != nil {
+			lastEntry = args.Entries[len(args.Entries)-1]
 		} else {
-			rf.commitIndex = args.LeaderCommit
+			lastEntry = nil
 		}
+		if lastEntry == nil {
+			rf.commitIndex = args.LeaderCommit
+		} else {
+			if args.LeaderCommit > lastEntry.LogIndex {
+				rf.commitIndex = lastEntry.LogIndex
+			} else {
+				rf.commitIndex = args.LeaderCommit
+			}
+		}
+
+		DPrintf("server %v commitIndex update to %v", rf.me, rf.commitIndex)
 	}
 
 	reply.Term = rf.currentTerm
 	reply.Success = true
-	rf.resetElect()
 	return
 }
 
@@ -364,7 +376,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	index = rf.commitIndex + 1
 	term = rf.currentTerm
-	go rf.replicateLog(command)
+	rf.replicateLog(command)
 
 	return index, term, isLeader
 }
@@ -379,47 +391,53 @@ func (rf *Raft) replicateLog(command interface{}) {
 		Term:     rf.currentTerm,
 		LogIndex: len(rf.log),
 	}
-
 	rf.log = append(rf.log, entry)
-	nextIndex := len(rf.log)
+	rf.newIndex[rf.me] = len(rf.log)
 
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
-			prevLogIndex := -1
-			prevLogTerm := 0
-			if rf.newIndex[i] > 0 {
-				prevLogIndex = rf.newIndex[i] - 1
-				prevLogTerm = rf.log[rf.newIndex[i]-1].Term
-			}
-			req := &AppendEntriesRequest{
-				Term:         rf.currentTerm,
-				LeaderId:     rf.me,
-				PrevLogIndex: prevLogIndex,
-				PrevLogTerm:  prevLogTerm,
-				Entries:      rf.log[rf.newIndex[i]:],
-				LeaderCommit: rf.commitIndex,
-			}
-			relpy := &AppendEntriesReply{}
-
-			go func(server int, req *AppendEntriesRequest, reply *AppendEntriesReply) {
-				for {
-					if rf.sendAppendEntries(server, req, reply) {
-						rf.replyCh <- &ReplyMsg{
-							Type:      AppendReply,
-							Term:      reply.Term,
-							Success:   reply.Success,
-							Server:    server,
-							NextIndex: nextIndex,
-						}
-						break
-					} else {
-						time.Sleep(time.Millisecond * 10)
-					}
-				}
-			}(i, req, relpy)
+			go func(server int) {
+				rf.appendLogs(server)
+			}(i)
 		}
 	}
+}
 
+func (rf *Raft) appendLogs(server int) {
+	if server == rf.me {
+		return
+	}
+
+	prevLogIndex := -1
+	prevLogTerm := 0
+	if rf.newIndex[server] > 0 {
+		prevLogIndex = rf.newIndex[server] - 1
+		prevLogTerm = rf.log[rf.newIndex[server]-1].Term
+	}
+
+	req := &AppendEntriesRequest{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      rf.log[rf.newIndex[server]:],
+		LeaderCommit: rf.commitIndex,
+	}
+
+	reply := &AppendEntriesReply{}
+	if rf.sendAppendEntries(server, req, reply) {
+		rf.replyCh <- &ReplyMsg{
+			Type:      AppendReply,
+			Term:      reply.Term,
+			Success:   reply.Success,
+			Server:    server,
+			NextIndex: len(rf.log),
+		}
+	} else {
+		time.AfterFunc(time.Millisecond*150, func() {
+			rf.appendLogs(server)
+		})
+	}
 }
 
 //
@@ -595,7 +613,7 @@ func (rf *Raft) Step(reply *ReplyMsg) {
 	} else {
 		switch reply.Type {
 		case VoteReply:
-			if reply.VoteGranted {
+			if reply.Success {
 				rf.myVote += 1
 			}
 			rf.resetElect()
@@ -605,6 +623,20 @@ func (rf *Raft) Step(reply *ReplyMsg) {
 		case AppendReply:
 			if reply.Success {
 				rf.newIndex[reply.Server] = reply.NextIndex
+				count := 0
+				for idx := 0; idx < len(rf.peers); idx++ {
+					if rf.newIndex[idx] >= reply.NextIndex {
+						count += 1
+					}
+				}
+				if count == rf.quorum {
+					if reply.NextIndex-1 > rf.commitIndex {
+						rf.commitIndex = reply.NextIndex - 1
+					}
+				}
+				if reply.NextIndex < len(rf.log) {
+					go rf.appendLogs(reply.Server)
+				}
 			}
 		default:
 			DPrintf("error msg type")
@@ -635,11 +667,10 @@ func (rf *Raft) election() {
 				reply := &RequestVoteReply{}
 				if rf.sendRequestVote(server, voteArg, reply) {
 					rf.replyCh <- &ReplyMsg{
-						Type:        VoteReply,
-						Term:        reply.Term,
-						Success:     false, //ignore
-						VoteGranted: reply.VoteGranted,
-						Server:      server,
+						Type:    VoteReply,
+						Term:    reply.Term,
+						Success: reply.VoteGranted, //ignore
+						Server:  server,
 					}
 				}
 			}(i, voteArg)
@@ -648,36 +679,9 @@ func (rf *Raft) election() {
 }
 
 func (rf *Raft) heartbeat() {
-	prevLogIndex := -1
-	prevLogTerm := -1
-	if len(rf.log) > 0 {
-		prevLogIndex = len(rf.log) - 1
-		prevLogTerm = rf.log[prevLogIndex].Term
-	}
-
-	hbReq := &AppendEntriesRequest{
-		Term:         rf.currentTerm,
-		LeaderId:     rf.me,
-		PrevLogIndex: prevLogIndex,
-		PrevLogTerm:  prevLogTerm,
-		Entries:      nil,
-		LeaderCommit: rf.commitIndex,
-	}
-
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
-			go func(server int, args *AppendEntriesRequest) {
-				reply := &AppendEntriesReply{}
-				if rf.sendAppendEntries(server, args, reply) {
-					rf.replyCh <- &ReplyMsg{
-						Type:        AppendReply,
-						Term:        reply.Term,
-						Success:     reply.Success,
-						VoteGranted: false, //ignore
-						Server:      server,
-					}
-				}
-			}(i, hbReq)
+			go rf.appendLogs(i)
 		}
 	}
 }
