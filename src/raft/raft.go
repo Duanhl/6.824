@@ -60,11 +60,13 @@ type Raft struct {
 	currentTerm int
 	preVotedFor int
 	leader      int
-	logs        *Logs
+	logs        *RaftLog
 
-	stopCh    chan bool
-	replyCh   chan *ReplyMsg
-	applyChan chan int
+	stopc chan bool     //stop msg
+	repc  chan ReplyMsg //reply send to main loop
+	procc chan ProcMsg  //other work gorouting send to main loop
+
+	applyChan chan ApplyMsg // as state machine
 
 	//candidate
 	myVote int
@@ -84,7 +86,7 @@ type Raft struct {
 
 const None int = -1
 
-type Logs struct {
+type RaftLog struct {
 	mu *sync.Mutex
 
 	entries []LogEntry
@@ -94,8 +96,17 @@ type Logs struct {
 	lastApplied int
 }
 
+func (raftLog *RaftLog) lastLogInfo(term int) (int, int) {
+	lastLog := LastEntry(raftLog.entries)
+	if lastLog != nil {
+		return lastLog.Term, lastLog.LogIndex
+	} else {
+		return term, None
+	}
+}
+
 // give term and logIndex is up-to-date than me
-func (logs *Logs) isUpToDate(term int, logIndex int) bool {
+func (logs *RaftLog) isUpToDate(term int, logIndex int) bool {
 	if len(logs.entries) == 0 {
 		return true
 	}
@@ -107,27 +118,25 @@ func (logs *Logs) isUpToDate(term int, logIndex int) bool {
 }
 
 //for follower
-func (logs *Logs) updateCommit(commitIndex int, lastLogIndex int) {
-	if commitIndex > logs.commitIndex {
-		logs.commitIndex = Min(commitIndex, lastLogIndex)
+func (raftLog *RaftLog) updateCommit(commitIndex int, lastLogIndex int, applyChan chan ApplyMsg) {
+	if commitIndex > raftLog.commitIndex {
+		raftLog.commitIndex = Min(commitIndex, lastLogIndex)
 	}
-	if logs.lastApplied < logs.commitIndex {
-		//applied to state machine
-		logs.lastApplied = logs.commitIndex
-	}
-}
-
-//for leader
-func (logs *Logs) addCommit() {
-	logs.commitIndex += 1
-
-	if logs.lastApplied < logs.commitIndex {
-		//applied to state machine
-		logs.lastApplied = logs.commitIndex
+	if raftLog.lastApplied < raftLog.commitIndex {
+		//apply to state machine
+		for idx := raftLog.lastApplied + 1; idx <= raftLog.commitIndex; idx++ {
+			applyMsg := ApplyMsg{
+				CommandValid: true,
+				Command:      raftLog.entries[idx].Command,
+				CommandIndex: raftLog.entries[idx].LogIndex,
+			}
+			applyChan <- applyMsg
+		}
+		raftLog.lastApplied = raftLog.commitIndex
 	}
 }
 
-func (logs *Logs) addCommand(command interface{}, term int) {
+func (logs *RaftLog) addCommand(command interface{}, term int) {
 	logs.mu.Lock()
 	defer logs.mu.Unlock()
 
@@ -139,7 +148,7 @@ func (logs *Logs) addCommand(command interface{}, term int) {
 	logs.entries = append(logs.entries, entry)
 }
 
-func (logs *Logs) appendLogs(prevLogIndex int, preLogTerm int, entries []LogEntry) bool {
+func (logs *RaftLog) appendLogs(prevLogIndex int, preLogTerm int, entries []LogEntry) bool {
 	logs.mu.Lock()
 	defer logs.mu.Unlock()
 
@@ -176,6 +185,7 @@ func (logs *Logs) appendLogs(prevLogIndex int, preLogTerm int, entries []LogEntr
 	return true
 }
 
+// server state
 type ServState uint
 
 const (
@@ -183,6 +193,35 @@ const (
 	Leader              = 1
 	Follower            = 2
 )
+
+//request type
+type RequestType string
+
+const (
+	VoteReq   RequestType = "voteReq"
+	AppendReq             = "appendReq"
+)
+
+//reply type
+type ReplyType string
+
+const (
+	VoteReply   ReplyType = "voteReply"
+	AppendReply           = "appendReply"
+)
+
+type ReplyMsg struct {
+	Type     ReplyType
+	Term     int
+	Success  bool
+	Server   int
+	LogIndex int //server end msg
+}
+
+type ProcMsg struct {
+	command interface{}
+	rstChan chan bool
+}
 
 // return currentTerm and whether this server
 // believes it is the leader.
@@ -342,21 +381,6 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
-type ReplyType string
-
-const (
-	VoteReply   ReplyType = "voteReply"
-	AppendReply           = "appendReply"
-)
-
-type ReplyMsg struct {
-	Type      ReplyType
-	Term      int
-	Success   bool
-	Server    int
-	NextIndex int
-}
-
 // handle append entries request
 func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesReply) {
 	rf.mu.Lock()
@@ -375,9 +399,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 	if rf.logs.appendLogs(args.PrevLogIndex, args.PrevLogTerm, args.Entries) {
 
 		if LastEntry(args.Entries) == nil {
-			rf.logs.updateCommit(args.LeaderCommit, args.LeaderCommit)
+			rf.logs.updateCommit(args.LeaderCommit, args.LeaderCommit, rf.applyChan)
 		} else {
-			rf.logs.updateCommit(args.LeaderCommit, LastEntry(args.Entries).LogIndex)
+			rf.logs.updateCommit(args.LeaderCommit, LastEntry(args.Entries).LogIndex, rf.applyChan)
 		}
 
 		rf.becomeFollower(args.Term, args.LeaderId)
@@ -424,23 +448,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 }
 
-func (rf *Raft) replicateLog(command interface{}) bool {
-
-	rf.logs.addCommand(command, rf.currentTerm)
-
-	for i := 0; i < len(rf.peers); i++ {
-		if i != rf.me {
-			go func(server int, term int) {
-				rf.appendLogs(server)
-			}(i, rf.currentTerm)
-		}
-	}
-
-}
-
-func (rf *Raft) appendLogs(server int) {
-}
-
 //
 // the tester calls Kill() when a Raft instance won't
 // be needed again. you are not required to do anything
@@ -449,7 +456,7 @@ func (rf *Raft) appendLogs(server int) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
-	rf.stopCh <- true
+	rf.stopc <- true
 }
 
 //
@@ -477,19 +484,27 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionElapsed = 0
 	rf.heartbeatElapsed = 0
 
-	rf.stopCh = make(chan bool)
-	rf.replyCh = make(chan *ReplyMsg)
-	rf.applyChan = make(chan int)
+	rf.stopc = make(chan bool, 1)
+	rf.repc = make(chan ReplyMsg, 1)
+	rf.procc = make(chan ProcMsg, 1)
+
+	rf.applyChan = applyCh
 
 	rf.leader = None
 	rf.quorum = len(rf.peers)/2 + 1 //majority
-	rf.preVotedFor = -1
+	rf.preVotedFor = None
 	rf.currentTerm = 0
 
-	rf.logs = &Logs{
-		entries:     make([]LogEntry, 0),
-		commitIndex: -1,
-		lastApplied: -1,
+	//flag log entry
+	emptyEntry := LogEntry{
+		Command:  nil,
+		Term:     0,
+		LogIndex: 0,
+	}
+	rf.logs = &RaftLog{
+		entries:     []LogEntry{emptyEntry},
+		commitIndex: 0,
+		lastApplied: 0,
 	}
 
 	rf.newIndex = make([]int, len(peers))
@@ -513,16 +528,18 @@ func (rf *Raft) run() {
 			rf.tick()
 			rf.tickMu.Unlock()
 
-		case msg := <-rf.replyCh:
-			rf.Step(msg)
+		case msg := <-rf.repc:
+			rf.StepReply(msg)
 
 		case msg := <-rf.procc:
-			rf.Step(msg)
+			rf.StepProc(msg)
 
-		case <-rf.stopCh:
+		case <-rf.stopc:
 			close(rf.applyChan)
-			close(rf.replyCh)
-			close(rf.stopCh)
+
+			close(rf.repc)
+			close(rf.stopc)
+			close(rf.procc)
 
 			return
 		}
@@ -608,82 +625,126 @@ func (rf *Raft) heartbeatTick() {
 	}
 }
 
-func (rf *Raft) Step(reply *ReplyMsg) {
-	if reply.Term > rf.currentTerm {
-		rf.becomeFollower(reply.Term, None) //$5.1
+func (rf *Raft) StepReply(msg ReplyMsg) {
+	if msg.Term > rf.currentTerm {
+		rf.becomeFollower(msg.Term, None) //$5.1
 		return
 	}
 
-	switch reply.Type {
+	switch msg.Type {
 	case VoteReply:
-		if reply.Success {
+		if msg.Success {
 			rf.myVote += 1
 		}
 		rf.resetElect()
 		if rf.myVote == rf.quorum {
 			rf.becomeLeader()
 		}
+
 	case AppendReply:
-		if reply.Success {
-			rf.newIndex[reply.Server] = reply.NextIndex
+		if msg.Success {
+			rf.matchIndex[msg.Server] = msg.LogIndex
+			rf.newIndex[msg.Server] = msg.LogIndex + 1
 			count := 0
 			for idx := 0; idx < len(rf.peers); idx++ {
-				if rf.newIndex[idx] >= reply.NextIndex {
+				if rf.matchIndex[idx] >= msg.LogIndex {
 					count += 1
 				}
 			}
 			if count == rf.quorum {
-				if reply.NextIndex-1 > rf.commitIndex {
-					rf.commitIndex = reply.NextIndex - 1
-				}
+				rf.logs.updateCommit(msg.LogIndex, msg.LogIndex, rf.applyChan)
 			}
-			if reply.NextIndex < len(rf.log) {
-				go rf.appendLogs(reply.Server)
-			}
+		} else {
+			rf.send(msg.Server, VoteReq)
 		}
 	default:
 		DPrintf("error msg type")
 	}
 }
 
+func (rf *Raft) StepProc(msg ProcMsg) {
+
+}
+
 // begin elect
 func (rf *Raft) election() {
 	DPrintf("server %v start election, term: %v", rf.me, rf.currentTerm)
 
-	lastLogIndex := -1
-	lastLogTerm := 0
-	if len(rf.log) > 0 {
-		lastLogIndex = rf.log[len(rf.log)-1].LogIndex
-		lastLogTerm = rf.log[len(rf.log)-1].Term
-	}
-	voteArg := &RequestVoteArgs{
-		Term:         rf.currentTerm,
-		CandidateId:  rf.me,
-		LastLogIndex: lastLogIndex,
-		LastLogTerm:  lastLogTerm,
-	}
-
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
-			go func(server int, args *RequestVoteArgs) {
-				reply := &RequestVoteReply{}
-				if rf.sendRequestVote(server, voteArg, reply) {
-					rf.replyCh <- &ReplyMsg{
-						Type:    VoteReply,
-						Term:    reply.Term,
-						Success: reply.VoteGranted, //ignore
-						Server:  server,
-					}
-				}
-			}(i, voteArg)
+			rf.send(i, VoteReq)
 		}
 	}
 }
 
+//heart beat
 func (rf *Raft) heartbeat() {
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
-			go rf.appendLogs(i)
+			rf.send(i, AppendReq)
 		}
+	}
+}
+
+func (rf *Raft) send(server int, reqType RequestType) {
+	if server == rf.me {
+		return
+	}
+	switch reqType {
+	case VoteReq:
+		go func() {
+			if rf.state != Candidate {
+				return
+			}
+
+			idx, term := rf.logs.lastLogInfo(rf.currentTerm)
+			req := &RequestVoteArgs{
+				Term:         rf.currentTerm,
+				CandidateId:  rf.me,
+				LastLogIndex: idx,
+				LastLogTerm:  term,
+			}
+
+			reply := &RequestVoteReply{}
+
+			if rf.sendRequestVote(server, req, reply) {
+				rf.repc <- ReplyMsg{
+					Type:    VoteReply,
+					Term:    reply.Term,
+					Success: reply.VoteGranted,
+					Server:  server,
+				}
+			}
+		}()
+
+	case AppendReq:
+		go func() {
+			if rf.state != Leader {
+				return
+			}
+
+			lastLog := rf.logs.entries[rf.matchIndex[server]]
+			end := len(rf.logs.entries)
+			req := &AppendEntriesRequest{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: lastLog.LogIndex,
+				PrevLogTerm:  lastLog.Term,
+				Entries:      rf.logs.entries[rf.newIndex[server]:end],
+				LeaderCommit: rf.logs.commitIndex,
+			}
+
+			reply := &AppendEntriesReply{}
+
+			if rf.sendAppendEntries(server, req, reply) {
+				rf.repc <- ReplyMsg{
+					Type:     VoteReply,
+					Term:     reply.Term,
+					Success:  reply.Success,
+					Server:   server,
+					LogIndex: end - 1,
+				}
+			}
+		}()
 	}
 }
