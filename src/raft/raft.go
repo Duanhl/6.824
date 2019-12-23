@@ -62,9 +62,10 @@ type Raft struct {
 	leader      int
 	logs        *RaftLog
 
-	stopc chan bool     //stop msg
-	repc  chan ReplyMsg //reply send to main loop
-	procc chan ProcMsg  //other work gorouting send to main loop
+	stopc  chan bool     //stop msg
+	repc   chan ReplyMsg //reply send to main loop
+	procc  chan ProcMsg  //other work gorouting send to main loop
+	rstMap map[int]chan bool
 
 	applyChan chan ApplyMsg // as state machine
 
@@ -136,7 +137,7 @@ func (raftLog *RaftLog) updateCommit(commitIndex int, lastLogIndex int, applyCha
 	}
 }
 
-func (logs *RaftLog) addCommand(command interface{}, term int) {
+func (logs *RaftLog) addCommand(command interface{}, term int) int {
 	logs.mu.Lock()
 	defer logs.mu.Unlock()
 
@@ -146,6 +147,7 @@ func (logs *RaftLog) addCommand(command interface{}, term int) {
 		LogIndex: len(logs.entries),
 	}
 	logs.entries = append(logs.entries, entry)
+	return len(logs.entries) - 1
 }
 
 func (logs *RaftLog) appendLogs(prevLogIndex int, preLogTerm int, entries []LogEntry) bool {
@@ -218,9 +220,16 @@ type ReplyMsg struct {
 	LogIndex int //server end msg
 }
 
+type ProcType string
+
+const (
+	Republic ProcType = "republicLog"
+)
+
 type ProcMsg struct {
-	command interface{}
-	rstChan chan bool
+	Type     ProcType
+	logIndex int
+	rstChan  chan bool
 }
 
 // return currentTerm and whether this server
@@ -441,10 +450,22 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, -1, false
 	}
 
-	if rf.replicateLog(command) {
-		return rf.logs.commitIndex, rf.currentTerm, true
-	} else {
-		return -1, -1, false
+	rst := make(chan bool, 1)
+	term := rf.currentTerm
+	logIdx := rf.logs.addCommand(command, term)
+	rf.procc <- ProcMsg{
+		Republic,
+		logIdx,
+		rst,
+	}
+
+	select {
+	case done := <-rst:
+		if done {
+			return logIdx, term, true
+		} else {
+			return -1, -1, false
+		}
 	}
 }
 
@@ -487,6 +508,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.stopc = make(chan bool, 1)
 	rf.repc = make(chan ReplyMsg, 1)
 	rf.procc = make(chan ProcMsg, 1)
+	rf.rstMap = make(map[int]chan bool)
 
 	rf.applyChan = applyCh
 
@@ -502,6 +524,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		LogIndex: 0,
 	}
 	rf.logs = &RaftLog{
+		mu:          new(sync.Mutex),
 		entries:     []LogEntry{emptyEntry},
 		commitIndex: 0,
 		lastApplied: 0,
@@ -553,6 +576,11 @@ func (rf *Raft) becomeFollower(term int, leader int) {
 	rf.currentTerm = term
 	rf.tick = rf.electionTick
 	rf.resetElect()
+
+	for key, v := range rf.rstMap {
+		v <- false
+		delete(rf.rstMap, key)
+	}
 }
 
 func (rf *Raft) becomeCandidate() {
@@ -578,7 +606,7 @@ func (rf *Raft) becomeLeader() {
 
 	for i := 0; i < len(rf.peers); i++ {
 		rf.newIndex[i] = len(rf.logs.entries) //leader contains most commit entries
-		rf.matchIndex[i] = -1
+		rf.matchIndex[i] = len(rf.logs.entries) - 1
 	}
 }
 
@@ -653,6 +681,8 @@ func (rf *Raft) StepReply(msg ReplyMsg) {
 			}
 			if count == rf.quorum {
 				rf.logs.updateCommit(msg.LogIndex, msg.LogIndex, rf.applyChan)
+				rf.rstMap[msg.LogIndex] <- true
+				delete(rf.rstMap, msg.LogIndex)
 			}
 		} else {
 			rf.send(msg.Server, VoteReq)
@@ -663,7 +693,17 @@ func (rf *Raft) StepReply(msg ReplyMsg) {
 }
 
 func (rf *Raft) StepProc(msg ProcMsg) {
-
+	switch msg.Type {
+	case Republic:
+		rf.rstMap[msg.logIndex] = msg.rstChan
+		for i := 0; i < len(rf.peers); i++ {
+			if i != rf.me {
+				rf.send(i, AppendReq)
+			}
+		}
+	default:
+		DPrintf("error msg type")
+	}
 }
 
 // begin elect
@@ -738,7 +778,7 @@ func (rf *Raft) send(server int, reqType RequestType) {
 
 			if rf.sendAppendEntries(server, req, reply) {
 				rf.repc <- ReplyMsg{
-					Type:     VoteReply,
+					Type:     AppendReply,
 					Term:     reply.Term,
 					Success:  reply.Success,
 					Server:   server,
