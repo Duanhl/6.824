@@ -62,7 +62,7 @@ type Raft struct {
 	leader      int
 	logs        *RaftLog
 
-	stopc  chan bool     //stop msg
+	stopc  chan struct{} //stop msg
 	repc   chan ReplyMsg //reply send to main loop
 	procc  chan ProcMsg  //other work gorouting send to main loop
 	rstMap map[int]chan bool
@@ -477,7 +477,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
-	rf.stopc <- true
+	close(rf.stopc)
 }
 
 //
@@ -505,7 +505,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionElapsed = 0
 	rf.heartbeatElapsed = 0
 
-	rf.stopc = make(chan bool, 1)
+	rf.stopc = make(chan struct{})
 	rf.repc = make(chan ReplyMsg, 1)
 	rf.procc = make(chan ProcMsg, 1)
 	rf.rstMap = make(map[int]chan bool)
@@ -559,10 +559,6 @@ func (rf *Raft) run() {
 
 		case <-rf.stopc:
 			close(rf.applyChan)
-
-			close(rf.repc)
-			close(rf.stopc)
-			close(rf.procc)
 
 			return
 		}
