@@ -60,12 +60,11 @@ type Raft struct {
 	currentTerm int
 	preVotedFor int
 	leader      int
-	logs        *RaftLog
+	logs        *Log
 
-	stopc  chan struct{} //stop msg
-	repc   chan ReplyMsg //reply send to main loop
-	procc  chan ProcMsg  //other work gorouting send to main loop
-	rstMap map[int]chan bool
+	stopc chan struct{} //stop msg
+	repc  chan ReplyMsg //reply send to main loop
+	procc chan ProcMsg  //other work gorouting send to main loop
 
 	applyChan chan ApplyMsg // as state machine
 
@@ -73,7 +72,7 @@ type Raft struct {
 	myVote int
 
 	//leader
-	newIndex   []int
+	nextIndex  []int
 	matchIndex []int
 
 	ticker           *time.Ticker
@@ -87,7 +86,7 @@ type Raft struct {
 
 const None int = -1
 
-type RaftLog struct {
+type Log struct {
 	mu *sync.Mutex
 
 	entries []LogEntry
@@ -95,96 +94,78 @@ type RaftLog struct {
 	commitIndex int
 
 	lastApplied int
-}
 
-func (raftLog *RaftLog) lastLogInfo(term int) (int, int) {
-	lastLog := LastEntry(raftLog.entries)
-	if lastLog != nil {
-		return lastLog.Term, lastLog.LogIndex
-	} else {
-		return term, None
-	}
+	me int
 }
 
 // give term and logIndex is up-to-date than me
-func (logs *RaftLog) isUpToDate(term int, logIndex int) bool {
-	if len(logs.entries) == 0 {
-		return true
-	}
-
-	lastLog := logs.entries[len(logs.entries)-1]
-
+func (raftLog *Log) isUpToDate(term int, logIndex int) bool {
+	lastLog := LastEntry(raftLog.entries)
 	return lastLog.Term < term ||
 		(lastLog.Term == term && lastLog.LogIndex <= logIndex)
 }
 
+func (raftLog *Log) match(prevLogIndex int, prevLogTerm int) bool {
+	return len(raftLog.entries) > prevLogIndex &&
+		raftLog.entries[prevLogIndex].Term == prevLogTerm
+}
+
 //for follower
-func (raftLog *RaftLog) updateCommit(commitIndex int, lastLogIndex int, applyChan chan ApplyMsg) {
+func (raftLog *Log) updateCommit(commitIndex int, lastLogIndex int, applyChan chan ApplyMsg) {
 	if commitIndex > raftLog.commitIndex {
 		raftLog.commitIndex = Min(commitIndex, lastLogIndex)
 	}
 	if raftLog.lastApplied < raftLog.commitIndex {
 		//apply to state machine
 		for idx := raftLog.lastApplied + 1; idx <= raftLog.commitIndex; idx++ {
+			entry := raftLog.entries[idx]
 			applyMsg := ApplyMsg{
 				CommandValid: true,
-				Command:      raftLog.entries[idx].Command,
-				CommandIndex: raftLog.entries[idx].LogIndex,
+				Command:      entry.Command,
+				CommandIndex: entry.LogIndex,
 			}
 			applyChan <- applyMsg
 		}
 		raftLog.lastApplied = raftLog.commitIndex
+		DPrintf("server %v update applied to logIndex %v", raftLog.me, raftLog.lastApplied)
 	}
 }
 
-func (logs *RaftLog) addCommand(command interface{}, term int) int {
-	logs.mu.Lock()
-	defer logs.mu.Unlock()
+func (raftLog *Log) addCommand(command interface{}, term int) int {
+	raftLog.mu.Lock()
+	defer raftLog.mu.Unlock()
 
+	idx := len(raftLog.entries)
 	entry := LogEntry{
 		Command:  command,
 		Term:     term,
-		LogIndex: len(logs.entries),
+		LogIndex: idx,
 	}
-	logs.entries = append(logs.entries, entry)
-	return len(logs.entries) - 1
+	raftLog.entries = append(raftLog.entries, entry)
+	return idx
 }
 
-func (logs *RaftLog) appendLogs(prevLogIndex int, preLogTerm int, entries []LogEntry) bool {
-	logs.mu.Lock()
-	defer logs.mu.Unlock()
-
-	if len(logs.entries) <= prevLogIndex {
-		return false
-	}
-
-	//leader have no logs, first command
-	if prevLogIndex == -1 {
-		if len(logs.entries) == 0 {
-			logs.entries = append(logs.entries, entries...)
-			return true
-		}
-		panic("if follower has log but leader has no, state error, ")
-	}
-
-	if logs.entries[prevLogIndex].Term != preLogTerm {
-		return false
-	}
+func (raftLog *Log) appendLogs(entries []LogEntry) {
+	raftLog.mu.Lock()
+	defer raftLog.mu.Unlock()
 
 	if len(entries) == 0 {
-		return true
+		return
 	}
 
-	firstEntry := entries[0]
-	conflict := len(logs.entries)
-	for idx := prevLogIndex + 1; idx < conflict; idx++ {
-		if logs.entries[idx].Term == firstEntry.Term {
-			conflict = idx
+	cr := len(raftLog.entries)
+	ce := 0
+	for i := 0; i < len(entries); i++ {
+		index, term := entries[i].LogIndex, entries[i].Term
+		if index >= len(raftLog.entries) {
+			break
+		} else if raftLog.entries[index].Term != term {
+			cr = index
+			ce = i
 			break
 		}
 	}
-	logs.entries = append(logs.entries[:conflict], entries...)
-	return true
+	raftLog.entries = append(raftLog.entries[:cr], entries[ce:]...)
 }
 
 // server state
@@ -229,7 +210,6 @@ const (
 type ProcMsg struct {
 	Type     ProcType
 	logIndex int
-	rstChan  chan bool
 }
 
 // return currentTerm and whether this server
@@ -321,16 +301,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if args.Term > rf.currentTerm { //$5.1
 		rf.becomeFollower(args.Term, None)
+		rf.preVotedFor = None
 	}
 
-	if rf.preVotedFor == None && rf.state != Candidate { //no vote for other candidate
-		if rf.logs.isUpToDate(args.Term, args.LastLogIndex) {
-			reply.VoteGranted = true
-			reply.Term = rf.currentTerm
-		} else {
-			reply.VoteGranted = false
-			reply.Term = rf.currentTerm
-		}
+	if rf.preVotedFor == None &&
+		rf.state != Candidate &&
+		rf.logs.isUpToDate(args.Term, args.LastLogIndex) { //no vote for other candidate
+
+		rf.preVotedFor = args.CandidateId
+		reply.VoteGranted = true
+		reply.Term = rf.currentTerm
+	} else {
+		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
 	}
 }
 
@@ -405,20 +388,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 		rf.becomeFollower(args.Term, args.LeaderId)
 	}
 
-	if rf.logs.appendLogs(args.PrevLogIndex, args.PrevLogTerm, args.Entries) {
-
-		if LastEntry(args.Entries) == nil {
-			rf.logs.updateCommit(args.LeaderCommit, args.LeaderCommit, rf.applyChan)
-		} else {
-			rf.logs.updateCommit(args.LeaderCommit, LastEntry(args.Entries).LogIndex, rf.applyChan)
-		}
-
-		rf.becomeFollower(args.Term, args.LeaderId)
-		reply.Term = rf.currentTerm
-		reply.Success = true
-	} else {
+	if !rf.logs.match(args.PrevLogIndex, args.PrevLogTerm) { //$5.3
 		reply.Term = rf.currentTerm
 		reply.Success = false
+
+		rf.becomeFollower(args.Term, args.LeaderId)
+	} else {
+		rf.logs.appendLogs(args.Entries)
+		rf.logs.updateCommit(args.LeaderCommit, LastEntry(rf.logs.entries).LogIndex, rf.applyChan)
+
+		rf.becomeFollower(args.Term, args.LeaderId)
+
+		reply.Term = rf.currentTerm
+		reply.Success = true
 	}
 }
 
@@ -448,24 +430,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader = rf.state == Leader
 	if !isLeader {
 		return -1, -1, false
-	}
-
-	rst := make(chan bool, 1)
-	term := rf.currentTerm
-	logIdx := rf.logs.addCommand(command, term)
-	rf.procc <- ProcMsg{
-		Republic,
-		logIdx,
-		rst,
-	}
-
-	select {
-	case done := <-rst:
-		if done {
-			return logIdx, term, true
-		} else {
-			return -1, -1, false
+	} else {
+		term := rf.currentTerm
+		logIdx := rf.logs.addCommand(command, term)
+		rf.procc <- ProcMsg{
+			Republic,
+			logIdx,
 		}
+		return logIdx, term, true
 	}
 }
 
@@ -508,7 +480,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.stopc = make(chan struct{})
 	rf.repc = make(chan ReplyMsg, 1)
 	rf.procc = make(chan ProcMsg, 1)
-	rf.rstMap = make(map[int]chan bool)
 
 	rf.applyChan = applyCh
 
@@ -523,14 +494,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		Term:     0,
 		LogIndex: 0,
 	}
-	rf.logs = &RaftLog{
+	rf.logs = &Log{
 		mu:          new(sync.Mutex),
 		entries:     []LogEntry{emptyEntry},
 		commitIndex: 0,
 		lastApplied: 0,
+		me:          rf.me,
 	}
 
-	rf.newIndex = make([]int, len(peers))
+	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 
 	// initialize from state persisted before a crash
@@ -559,7 +531,6 @@ func (rf *Raft) run() {
 
 		case <-rf.stopc:
 			close(rf.applyChan)
-
 			return
 		}
 	}
@@ -567,16 +538,10 @@ func (rf *Raft) run() {
 
 func (rf *Raft) becomeFollower(term int, leader int) {
 	rf.leader = leader
-	rf.preVotedFor = None
 	rf.state = Follower
 	rf.currentTerm = term
 	rf.tick = rf.electionTick
 	rf.resetElect()
-
-	for key, v := range rf.rstMap {
-		v <- false
-		delete(rf.rstMap, key)
-	}
 }
 
 func (rf *Raft) becomeCandidate() {
@@ -600,9 +565,10 @@ func (rf *Raft) becomeLeader() {
 	rf.leader = rf.me
 	rf.resetHeartbeat()
 
+	nextIdx := len(rf.logs.entries)
 	for i := 0; i < len(rf.peers); i++ {
-		rf.newIndex[i] = len(rf.logs.entries) //leader contains most commit entries
-		rf.matchIndex[i] = len(rf.logs.entries) - 1
+		rf.nextIndex[i] = nextIdx //leader contains most commit entries
+		rf.matchIndex[i] = 0
 	}
 }
 
@@ -657,18 +623,18 @@ func (rf *Raft) StepReply(msg ReplyMsg) {
 
 	switch msg.Type {
 	case VoteReply:
-		if msg.Success {
+		if msg.Success && msg.Term == rf.currentTerm {
 			rf.myVote += 1
+			if rf.myVote == rf.quorum {
+				rf.becomeLeader()
+			}
 		}
 		rf.resetElect()
-		if rf.myVote == rf.quorum {
-			rf.becomeLeader()
-		}
 
 	case AppendReply:
 		if msg.Success {
 			rf.matchIndex[msg.Server] = msg.LogIndex
-			rf.newIndex[msg.Server] = msg.LogIndex + 1
+			rf.nextIndex[msg.Server] = msg.LogIndex + 1
 			count := 0
 			for idx := 0; idx < len(rf.peers); idx++ {
 				if rf.matchIndex[idx] >= msg.LogIndex {
@@ -676,12 +642,12 @@ func (rf *Raft) StepReply(msg ReplyMsg) {
 				}
 			}
 			if count == rf.quorum {
+				DPrintf("server %v update commit to %v", rf.me, msg.LogIndex)
 				rf.logs.updateCommit(msg.LogIndex, msg.LogIndex, rf.applyChan)
-				rf.rstMap[msg.LogIndex] <- true
-				delete(rf.rstMap, msg.LogIndex)
 			}
 		} else {
-			rf.send(msg.Server, VoteReq)
+			rf.nextIndex[msg.Server] = rf.nextIndex[msg.Server] - 1
+			rf.send(msg.Server, AppendReq)
 		}
 	default:
 		DPrintf("error msg type")
@@ -691,7 +657,6 @@ func (rf *Raft) StepReply(msg ReplyMsg) {
 func (rf *Raft) StepProc(msg ProcMsg) {
 	switch msg.Type {
 	case Republic:
-		rf.rstMap[msg.logIndex] = msg.rstChan
 		for i := 0; i < len(rf.peers); i++ {
 			if i != rf.me {
 				rf.send(i, AppendReq)
@@ -733,7 +698,8 @@ func (rf *Raft) send(server int, reqType RequestType) {
 				return
 			}
 
-			idx, term := rf.logs.lastLogInfo(rf.currentTerm)
+			lastEntry := LastEntry(rf.logs.entries)
+			idx, term := lastEntry.LogIndex, lastEntry.Term
 			req := &RequestVoteArgs{
 				Term:         rf.currentTerm,
 				CandidateId:  rf.me,
@@ -759,14 +725,14 @@ func (rf *Raft) send(server int, reqType RequestType) {
 				return
 			}
 
-			lastLog := rf.logs.entries[rf.matchIndex[server]]
+			lastLog := rf.logs.entries[rf.nextIndex[server]-1]
 			end := len(rf.logs.entries)
 			req := &AppendEntriesRequest{
 				Term:         rf.currentTerm,
 				LeaderId:     rf.me,
 				PrevLogIndex: lastLog.LogIndex,
 				PrevLogTerm:  lastLog.Term,
-				Entries:      rf.logs.entries[rf.newIndex[server]:end],
+				Entries:      rf.logs.entries[rf.nextIndex[server]:end],
 				LeaderCommit: rf.logs.commitIndex,
 			}
 

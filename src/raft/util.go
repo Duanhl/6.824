@@ -2,7 +2,6 @@ package raft
 
 import (
 	"log"
-	"time"
 )
 
 // Debugging
@@ -29,28 +28,4 @@ func LastEntry(entries []LogEntry) *LogEntry {
 	} else {
 		return &entries[len(entries)-1]
 	}
-}
-
-type CompleteFuture struct {
-	OnSuccess    func()
-	OnComplete   func()
-	Success      int
-	Complete     int
-	succ         int
-	fail         int
-	successChan  chan struct{}
-	completeChan chan struct{}
-	ticker       time.Ticker
-}
-
-func (cf *CompleteFuture) addSuccess() {
-
-}
-
-func (cf *CompleteFuture) addFailure() {
-
-}
-
-func (cf *CompleteFuture) waitForDone() {
-
 }
