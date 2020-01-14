@@ -20,6 +20,7 @@ package raft
 import (
 	"labrpc"
 	"math/rand"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -99,10 +100,10 @@ type Log struct {
 }
 
 // give term and logIndex is up-to-date than me
-func (raftLog *Log) isUpToDate(term int, logIndex int) bool {
+func (raftLog *Log) upToDateThan(term int, logIndex int) bool {
 	lastLog := LastEntry(raftLog.entries)
-	return lastLog.Term < term ||
-		(lastLog.Term == term && lastLog.LogIndex <= logIndex)
+	return lastLog.Term > term ||
+		(lastLog.Term == term && lastLog.LogIndex > logIndex)
 }
 
 func (raftLog *Log) match(prevLogIndex int, prevLogTerm int) bool {
@@ -127,7 +128,6 @@ func (raftLog *Log) updateCommit(commitIndex int, lastLogIndex int, applyChan ch
 			applyChan <- applyMsg
 		}
 		raftLog.lastApplied = raftLog.commitIndex
-		DPrintf("server %v update applied to logIndex %v", raftLog.me, raftLog.lastApplied)
 	}
 }
 
@@ -142,7 +142,17 @@ func (raftLog *Log) addCommand(command interface{}, term int) int {
 		LogIndex: idx,
 	}
 	raftLog.entries = append(raftLog.entries, entry)
+	DPrintf("leader %v add command %v, current log: %s", raftLog.me, command, raftLog)
 	return idx
+}
+
+func (raftLog *Log) String() string {
+	s := "["
+	for i := 1; i < len(raftLog.entries); i++ {
+		s += strconv.Itoa(raftLog.entries[i].Command.(int)) + ","
+	}
+	s += "]"
+	return s
 }
 
 func (raftLog *Log) appendLogs(entries []LogEntry) {
@@ -306,7 +316,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if rf.preVotedFor == None &&
 		rf.state != Candidate &&
-		rf.logs.isUpToDate(args.Term, args.LastLogIndex) { //no vote for other candidate
+		!rf.logs.upToDateThan(args.LastLogTerm, args.LastLogIndex) { //no vote for other candidate
 
 		rf.preVotedFor = args.CandidateId
 		reply.VoteGranted = true
@@ -388,7 +398,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 		rf.becomeFollower(args.Term, args.LeaderId)
 	}
 
-	if !rf.logs.match(args.PrevLogIndex, args.PrevLogTerm) { //$5.3
+	if !rf.logs.match(args.PrevLogIndex, args.PrevLogTerm) { //$5.3, log inconsistency
 		reply.Term = rf.currentTerm
 		reply.Success = false
 
@@ -431,6 +441,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if !isLeader {
 		return -1, -1, false
 	} else {
+		DPrintf("leader %v receive command %v", rf.me, command)
 		term := rf.currentTerm
 		logIdx := rf.logs.addCommand(command, term)
 		rf.procc <- ProcMsg{
@@ -621,15 +632,19 @@ func (rf *Raft) StepReply(msg ReplyMsg) {
 		return
 	}
 
+	if msg.Term < rf.currentTerm {
+		return
+	}
+
 	switch msg.Type {
 	case VoteReply:
-		if msg.Success && msg.Term == rf.currentTerm {
+		if msg.Success {
 			rf.myVote += 1
 			if rf.myVote == rf.quorum {
 				rf.becomeLeader()
 			}
+			rf.resetElect()
 		}
-		rf.resetElect()
 
 	case AppendReply:
 		if msg.Success {
@@ -642,10 +657,15 @@ func (rf *Raft) StepReply(msg ReplyMsg) {
 				}
 			}
 			if count == rf.quorum {
-				DPrintf("server %v update commit to %v", rf.me, msg.LogIndex)
-				rf.logs.updateCommit(msg.LogIndex, msg.LogIndex, rf.applyChan)
+				commit := Max(msg.LogIndex, rf.logs.commitIndex)
+				if commit > rf.logs.commitIndex {
+					DPrintf("leader %v update commit to %v", rf.me, msg.LogIndex)
+					rf.logs.updateCommit(commit, commit, rf.applyChan)
+				}
 			}
 		} else {
+			DPrintf("leader %v received from %v because inconsistency log, leader logIndex %v, follower commit index: %v",
+				rf.me, msg.Server, len(rf.logs.entries)-1, msg.LogIndex)
 			rf.nextIndex[msg.Server] = rf.nextIndex[msg.Server] - 1
 			rf.send(msg.Server, AppendReq)
 		}
@@ -657,6 +677,9 @@ func (rf *Raft) StepReply(msg ReplyMsg) {
 func (rf *Raft) StepProc(msg ProcMsg) {
 	switch msg.Type {
 	case Republic:
+		DPrintf("leader %v republic log, logIndex: %v", rf.me, len(rf.logs.entries)-1)
+		rf.matchIndex[rf.me] = len(rf.logs.entries) - 1
+		rf.nextIndex[rf.me] = len(rf.logs.entries)
 		for i := 0; i < len(rf.peers); i++ {
 			if i != rf.me {
 				rf.send(i, AppendReq)

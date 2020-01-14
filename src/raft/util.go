@@ -22,6 +22,14 @@ func Min(left int, right int) int {
 	}
 }
 
+func Max(left int, right int) int {
+	if left > right {
+		return left
+	} else {
+		return right
+	}
+}
+
 func LastEntry(entries []LogEntry) *LogEntry {
 	if entries == nil || len(entries) == 0 {
 		return nil
