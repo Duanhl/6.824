@@ -92,6 +92,16 @@ const (
 )
 
 type Logs struct {
+	logs []Log
+}
+
+func (logs *Logs) lastEntryInfo() (int, int) {
+	return len(logs.logs), logs.logs[len(logs.logs)-1].term
+}
+
+type Log struct {
+	val  interface{}
+	term int
 }
 
 type Msg struct {
@@ -167,6 +177,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -175,6 +189,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -301,10 +317,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.servState = Follower
 	rf.currentTerm = 0
 	rf.votedFor = me
-	rf.log = &Logs{}
 
-	rf.commitIndex = -1
-	rf.lastApplied = -1
+	logs := make([]Log, 10)
+	logs = append(logs, Log{
+		val:  nil,
+		term: 0,
+	})
+	rf.log = &Logs{
+		logs,
+	}
+
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 
 	rf.nextIdxs = make([]int, len(peers))
 	rf.matchIdxs = make([]int, len(peers))
@@ -316,7 +340,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.hbTimeout = 100 + rand.Int63n(10)
 	rf.elecElapsed = 0
 	rf.hbElapsed = 0
-	rf.elecTicker = time.NewTicker(1000)
+	rf.elecTicker = time.NewTicker(10)
 
 	go rf.run()
 
@@ -330,15 +354,23 @@ func (rf *Raft) run() {
 	case proc := <-rf.procc:
 		switch proc.msgType {
 		case VoteReq:
-			rf.stepReq(proc.body.(*RequestVoteArgs), proc.res)
+			rf.stepVoteReq(proc.body.(*RequestVoteArgs), proc.res)
 		}
 	case <-rf.stopc:
 		return
 	}
 }
 
-func (rf *Raft) stepReq(req *RequestVoteArgs, replyc <-chan interface{}) {
+func (rf *Raft) stepVoteReq(req *RequestVoteArgs, replyc chan<- interface{}) {
+	if req.Term < rf.currentTerm {
+		replyc <- &RequestVoteReply{
+			rf.currentTerm,
+			false,
+		}
+	}
+	if rf.votedFor == -1 {
 
+	}
 }
 
 func (rf *Raft) dealElec() {
@@ -368,7 +400,13 @@ func (rf *Raft) becomeCandidate() {
 }
 
 func (rf *Raft) sendVoteReq() {
-	arg := &RequestVoteArgs{}
+	lidx, lterm := rf.log.lastEntryInfo()
+	arg := &RequestVoteArgs{
+		rf.currentTerm,
+		rf.me,
+		lidx,
+		lterm,
+	}
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			go func(server int) {
