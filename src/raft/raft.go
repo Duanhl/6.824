@@ -368,5 +368,19 @@ func (rf *Raft) becomeCandidate() {
 }
 
 func (rf *Raft) sendVoteReq() {
-
+	arg := &RequestVoteArgs{}
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me {
+			go func(server int) {
+				reply := &RequestVoteReply{}
+				ok := rf.sendRequestVote(server, arg, reply)
+				if ok {
+					rf.procc <- Msg{
+						msgType: VoteRes,
+						body:    reply,
+					}
+				}
+			}(i)
+		}
+	}
 }
