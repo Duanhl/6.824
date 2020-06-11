@@ -93,13 +93,20 @@ func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bo
 	qe.Encode(args)
 	req.args = qb.Bytes()
 
+	//
+	// send the request.
+	//
 	select {
 	case e.ch <- req:
-		// ok
+		// the request has been sent.
 	case <-e.done:
+		// entire Network has been destroyed.
 		return false
 	}
 
+	//
+	// wait for the reply.
+	//
 	rep := <-req.replyCh
 	if rep.ok {
 		rb := bytes.NewBuffer(rep.reply)
@@ -125,6 +132,7 @@ type Network struct {
 	endCh          chan reqMsg
 	done           chan struct{} // closed when Network is cleaned up
 	count          int32         // total RPC count, for statistics
+	bytes          int64         // total bytes send, for statistics
 }
 
 func MakeNetwork() *Network {
@@ -143,7 +151,8 @@ func MakeNetwork() *Network {
 			select {
 			case xreq := <-rn.endCh:
 				atomic.AddInt32(&rn.count, 1)
-				go rn.ProcessReq(xreq)
+				atomic.AddInt64(&rn.bytes, int64(len(xreq.args)))
+				go rn.processReq(xreq)
 			case <-rn.done:
 				return
 			}
@@ -178,7 +187,7 @@ func (rn *Network) LongDelays(yes bool) {
 	rn.longDelays = yes
 }
 
-func (rn *Network) ReadEndnameInfo(endname interface{}) (enabled bool,
+func (rn *Network) readEndnameInfo(endname interface{}) (enabled bool,
 	servername interface{}, server *Server, reliable bool, longreordering bool,
 ) {
 	rn.mu.Lock()
@@ -194,7 +203,7 @@ func (rn *Network) ReadEndnameInfo(endname interface{}) (enabled bool,
 	return
 }
 
-func (rn *Network) IsServerDead(endname interface{}, servername interface{}, server *Server) bool {
+func (rn *Network) isServerDead(endname interface{}, servername interface{}, server *Server) bool {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
@@ -204,8 +213,8 @@ func (rn *Network) IsServerDead(endname interface{}, servername interface{}, ser
 	return false
 }
 
-func (rn *Network) ProcessReq(req reqMsg) {
-	enabled, servername, server, reliable, longreordering := rn.ReadEndnameInfo(req.endname)
+func (rn *Network) processReq(req reqMsg) {
+	enabled, servername, server, reliable, longreordering := rn.readEndnameInfo(req.endname)
 
 	if enabled && servername != nil && server != nil {
 		if reliable == false {
@@ -241,7 +250,7 @@ func (rn *Network) ProcessReq(req reqMsg) {
 			case reply = <-ech:
 				replyOK = true
 			case <-time.After(100 * time.Millisecond):
-				serverDead = rn.IsServerDead(req.endname, servername, server)
+				serverDead = rn.isServerDead(req.endname, servername, server)
 				if serverDead {
 					go func() {
 						<-ech // drain channel to let the goroutine created earlier terminate
@@ -256,7 +265,7 @@ func (rn *Network) ProcessReq(req reqMsg) {
 		// to an Append, but the server persisted the update
 		// into the old Persister. config.go is careful to call
 		// DeleteServer() before superseding the Persister.
-		serverDead = rn.IsServerDead(req.endname, servername, server)
+		serverDead = rn.isServerDead(req.endname, servername, server)
 
 		if replyOK == false || serverDead == true {
 			// server was killed while we were waiting; return error.
@@ -271,9 +280,11 @@ func (rn *Network) ProcessReq(req reqMsg) {
 			// the number of goroutines, so that the race
 			// detector is less likely to get upset.
 			time.AfterFunc(time.Duration(ms)*time.Millisecond, func() {
+				atomic.AddInt64(&rn.bytes, int64(len(reply.reply)))
 				req.replyCh <- reply
 			})
 		} else {
+			atomic.AddInt64(&rn.bytes, int64(len(reply.reply)))
 			req.replyCh <- reply
 		}
 	} else {
@@ -359,6 +370,11 @@ func (rn *Network) GetCount(servername interface{}) int {
 func (rn *Network) GetTotalCount() int {
 	x := atomic.LoadInt32(&rn.count)
 	return int(x)
+}
+
+func (rn *Network) GetTotalBytes() int64 {
+	x := atomic.LoadInt64(&rn.bytes)
+	return x
 }
 
 //
