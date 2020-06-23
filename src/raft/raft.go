@@ -558,7 +558,8 @@ func (rf *Raft) apply() {
 		}
 		rf.lastApplied = rf.commitIndex
 
-		DPrintf("server %v logs: %v", rf.me, entries2string(rf.logs))
+		applyTerm := rf.logs[rf.lastApplied].Term
+		DPrintf("server %v apply logs: (term: %v, index: %v)", rf.me, applyTerm, rf.lastApplied)
 	}
 }
 
@@ -677,7 +678,9 @@ func (rf *Raft) stepCommand(command interface{}, replyc chan interface{}) {
 			Val:  command,
 			Term: rf.currentTerm,
 		})
-		DPrintf("Leader %v(term: %v) step command: %v, logs: %v", rf.me, rf.currentTerm, command, entries2string(rf.logs))
+
+		lastIdx, lastTerm := rf.lastEntryInfo()
+		DPrintf("Leader %v(term: %v) step command, logs: (term: %v, idx: %v)", rf.me, rf.currentTerm, lastTerm, lastIdx)
 		replyc <- &StartCommandRes{
 			term:     rf.currentTerm,
 			index:    len(rf.logs) - 1,
