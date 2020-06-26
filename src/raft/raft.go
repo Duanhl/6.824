@@ -633,8 +633,7 @@ func (rf *Raft) stepAppendReq(msg Msg) {
 		return
 	}
 
-	rf.becomeFollower(msg.term)
-
+	rf.elecElapsed = 0
 	if !rf.entryMatched(msg.logTerm, msg.logIndex) {
 		rf.send(Msg{
 			msgType: AppRes,
