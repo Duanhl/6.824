@@ -17,10 +17,22 @@ type Entry struct {
 	Value string
 }
 
-func (st *SSTable) get(key string) string {
+func (st *SSTable) Start() {
+
+}
+
+func (st *SSTable) Close() {
+
+}
+
+func (st *SSTable) Get(key string) string {
 	return ""
 }
 
-func (st *SSTable) rangeKey(start string, end string) []Entry {
+func (st *SSTable) Put(key string, value string) string {
+	return ""
+}
+
+func (st *SSTable) Range(start string, end string) []Entry {
 	return make([]Entry, 1)
 }
