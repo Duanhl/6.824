@@ -293,6 +293,7 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	resc := make(chan interface{})
+	defer close(resc)
 
 	rf.procc <- Msg{
 		msgType:  VoteReq,
@@ -331,6 +332,7 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	resc := make(chan interface{})
+	defer close(resc)
 
 	rf.procc <- Msg{
 		msgType: AppReq,

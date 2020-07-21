@@ -1,7 +1,12 @@
 package sstable
 
+import "sync"
+
 type SSTable struct {
-	state State
+	state     State
+	lock      *sync.Mutex
+	writeable *SkipList
+	immutable *SkipList
 }
 
 type State uint8
@@ -30,6 +35,9 @@ func (st *SSTable) Get(key string) string {
 }
 
 func (st *SSTable) Put(key string, value string) string {
+	st.lock.Lock()
+	defer st.lock.Unlock()
+
 	return ""
 }
 
