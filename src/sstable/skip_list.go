@@ -22,20 +22,30 @@ type SkipListNode struct {
 type SkipList struct {
 	header *SkipListNode
 	tail   *SkipListNode
-	length int64
+	length int
 	level  int
 }
 
-type NotFoundKeyError struct {
-	errMsg string
+type SkipListIterator struct {
+	sl   *SkipList
+	curr *SkipListNode
 }
 
-func (nfe *NotFoundKeyError) Error() string {
-	return nfe.errMsg
+func (sli *SkipListIterator) HasNext() bool {
+	return sli.curr.forwards[0].key != ""
 }
 
-func NotFoundError(key string) *NotFoundKeyError {
-	return &NotFoundKeyError{errMsg: key + " not found"}
+func (sli *SkipListIterator) Next() (*KV, error) {
+	if !sli.HasNext() {
+		return nil, NoNextElementError()
+	} else {
+		kv := &KV{
+			key: sli.curr.forwards[0].key,
+			val: sli.curr.forwards[0].val,
+		}
+		sli.curr = sli.curr.forwards[0]
+		return kv, nil
+	}
 }
 
 func createSl() SkipList {
@@ -48,12 +58,12 @@ func createSl() SkipList {
 	return skipList
 }
 
-func (sl *SkipList) Get(key string) (string, error, int) {
-	sln, count := sl.lastLevelNode(key)
+func (sl *SkipList) Get(key string) (string, error) {
+	sln := sl.lastLevelNode(key)
 	if sln.key != key {
-		return "", NotFoundError(key), count
+		return "", NotFoundError(key)
 	} else {
-		return sln.val, nil, count
+		return sln.val, nil
 	}
 }
 
@@ -62,8 +72,18 @@ func (sl *SkipList) Range(start, end string) []KV {
 		return nil
 	}
 	var sls []KV
-	lln, _ := sl.lastLevelNode(start)
-	for lln.key <= end {
+	lln := sl.lastLevelNode(start)
+	if lln.key == "" {
+		return nil
+	}
+	if lln.key == start {
+		sls = append(sls, KV{
+			key: lln.key,
+			val: lln.val,
+		})
+	}
+	lln = lln.forwards[0]
+	for lln.key != "" && lln.key <= end {
 		sls = append(sls, KV{
 			key: lln.key,
 			val: lln.val,
@@ -73,16 +93,14 @@ func (sl *SkipList) Range(start, end string) []KV {
 	return sls
 }
 
-func (sl *SkipList) lastLevelNode(key string) (*SkipListNode, int) {
-	count := 0
+func (sl *SkipList) lastLevelNode(key string) *SkipListNode {
 	x := sl.header
 	for i := sl.level - 1; i > -1; i-- {
 		for forwardKey := x.forwards[i].key; forwardKey != "" && forwardKey < key; forwardKey = x.forwards[i].key {
 			x = x.forwards[i]
-			count += 1
 		}
 	}
-	return x.forwards[0], count
+	return x.forwards[0]
 }
 
 func (sl *SkipList) Put(key string, val string) string {
@@ -112,6 +130,7 @@ func (sl *SkipList) Put(key string, val string) string {
 			sln.forwards[i] = update[i].forwards[i]
 			update[i].forwards[i] = sln
 		}
+		sl.length++
 		return ""
 	}
 }
@@ -136,9 +155,29 @@ func (sl *SkipList) Del(key string) (string, error) {
 		for sl.level > -1 && sl.header.forwards[sl.level-1] == nil {
 			sl.level -= 1
 		}
+		sl.length--
 		return x.val, nil
 	} else {
 		return "", NotFoundError(key)
+	}
+}
+
+func (sl *SkipList) Size() int {
+	return sl.length
+}
+
+func (sl *SkipList) Iter() *SkipListIterator {
+	return &SkipListIterator{
+		sl:   sl,
+		curr: sl.header,
+	}
+}
+
+func (sl *SkipList) IterKey(key string) *SkipListIterator {
+	llv := sl.lastLevelNode(key)
+	return &SkipListIterator{
+		sl:   sl,
+		curr: llv,
 	}
 }
 
@@ -157,7 +196,7 @@ func makeNode(level int, key string, val string) *SkipListNode {
 
 func randomLevel() int {
 	lvl := 0
-	for rand.Float32() < SlP && lvl < SlMaxLevel {
+	for rand.Float32() < SlP && lvl < SlMaxLevel-1 {
 		lvl++
 	}
 	return lvl
