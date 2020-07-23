@@ -1,23 +1,15 @@
 package sstable
 
-type NotFoundKeyError struct {
-	errMsg string
+import "errors"
+
+func NotFoundError(key string) error {
+	return errors.New(key + " not found ")
 }
 
-func (nfe *NotFoundKeyError) Error() string {
-	return nfe.errMsg
+var NoNextElementError = errors.New("No Next Element ")
+
+func IllegalArgumentErrors(argument, val string) error {
+	return errors.New("argument [" + argument + "] with wrong value: " + val)
 }
 
-func NotFoundError(key string) *NotFoundKeyError {
-	return &NotFoundKeyError{errMsg: key + " not found"}
-}
-
-type NoNextError struct{}
-
-func (nne *NoNextError) Error() string {
-	return "No Next Element"
-}
-
-func NoNextElementError() *NoNextError {
-	return &NoNextError{}
-}
+var OutOfIndexError = errors.New("Out Of Index ")

@@ -3,8 +3,8 @@ package sstable
 import "math/rand"
 
 const (
-	SlMaxLevel = 12  // 2 ** 12 = 4096, at most 4096 element dump to log files
-	SlP        = 0.5 //random probability
+	SlP        = 0.25 //random probability, Normalized Search Times L(n)/p, avg points per node 1/(1-p)
+	SlMaxLevel = 8    // (1 / SLP) ** 8 = 65536, at most 65536 element dump to log files
 )
 
 type KV struct {
@@ -15,13 +15,11 @@ type KV struct {
 type SkipListNode struct {
 	key      string
 	val      string
-	backward *SkipListNode
 	forwards []*SkipListNode //for n'th level forward
 }
 
 type SkipList struct {
 	header *SkipListNode
-	tail   *SkipListNode
 	length int
 	level  int
 }
@@ -37,7 +35,7 @@ func (sli *SkipListIterator) HasNext() bool {
 
 func (sli *SkipListIterator) Next() (*KV, error) {
 	if !sli.HasNext() {
-		return nil, NoNextElementError()
+		return nil, NoNextElementError
 	} else {
 		kv := &KV{
 			key: sli.curr.forwards[0].key,
@@ -59,6 +57,9 @@ func createSl() SkipList {
 }
 
 func (sl *SkipList) Get(key string) (string, error) {
+	if key == "" {
+		return "", IllegalArgumentErrors("key", "")
+	}
 	sln := sl.lastLevelNode(key)
 	if sln.key != key {
 		return "", NotFoundError(key)
@@ -104,6 +105,9 @@ func (sl *SkipList) lastLevelNode(key string) *SkipListNode {
 }
 
 func (sl *SkipList) Put(key string, val string) string {
+	if key == "" {
+		return ""
+	}
 	update := make([]*SkipListNode, SlMaxLevel)
 	x := sl.header
 	for i := sl.level - 1; i > -1; i-- {
@@ -136,6 +140,9 @@ func (sl *SkipList) Put(key string, val string) string {
 }
 
 func (sl *SkipList) Del(key string) (string, error) {
+	if key == "" {
+		return "", IllegalArgumentErrors("key", key)
+	}
 	update := make([]*SkipListNode, SlMaxLevel)
 	x := sl.header
 	for i := sl.level - 1; i > -1; i-- {
@@ -189,7 +196,6 @@ func makeNode(level int, key string, val string) *SkipListNode {
 	return &SkipListNode{
 		key:      key,
 		val:      val,
-		backward: nil,
 		forwards: levels,
 	}
 }

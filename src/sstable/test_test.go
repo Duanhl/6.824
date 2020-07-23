@@ -2,6 +2,7 @@ package sstable
 
 import (
 	"log"
+	"os"
 	"strconv"
 	"testing"
 )
@@ -101,5 +102,33 @@ func TestSkipList_Iter(t *testing.T) {
 		if kv.key != strconv.Itoa(771+i) {
 			log.Fatal("error iter value get")
 		}
+	}
+}
+
+func TestMmap(t *testing.T) {
+	f, err := os.Create("/tmp/sstable/log000")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mmap, err := MapNewRegion(f, 0, BlockSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mmap.close()
+
+	target := "Just in File"
+	b1 := []byte(target)
+	if _, err := mmap.Write(b1); err != nil {
+		t.Fatal(err)
+	}
+
+	b2 := make([]byte, len(b1))
+	if _, err := mmap.Read(b2); err != nil {
+		t.Fatal(err)
+	}
+
+	if target != string(b2) {
+		t.Fatal("Read error value: " + string(b2))
 	}
 }

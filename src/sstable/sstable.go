@@ -7,6 +7,8 @@ type SSTable struct {
 	lock      *sync.Mutex
 	writeable *SkipList
 	immutable *SkipList
+
+	metadata *MetaDataBlock
 }
 
 type State uint8
@@ -17,13 +19,7 @@ const (
 	Closed            = 2
 )
 
-type Entry struct {
-	Key   string
-	Value string
-}
-
 func (st *SSTable) Start() {
-
 }
 
 func (st *SSTable) Close() {
@@ -41,6 +37,6 @@ func (st *SSTable) Put(key string, value string) string {
 	return ""
 }
 
-func (st *SSTable) Range(start string, end string) []Entry {
-	return make([]Entry, 1)
+func (st *SSTable) Range(start string, end string) []KV {
+	return make([]KV, 1)
 }
