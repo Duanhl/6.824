@@ -262,7 +262,7 @@ func (rn *Network) processReq(req reqMsg) {
 		// do not reply if DeleteServer() has been called, i.e.
 		// the server has been killed. this is needed to avoid
 		// situation in which a client gets a positive reply
-		// to an Append, but the server persisted the update
+		// to an AppendEntries, but the server persisted the update
 		// into the old Persister. config.go is careful to call
 		// DeleteServer() before superseding the Persister.
 		serverDead = rn.isServerDead(req.endname, servername, server)

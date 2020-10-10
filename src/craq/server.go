@@ -8,6 +8,9 @@ type CraqServer struct {
 	endserver *CraqServer
 }
 
+type RawNode struct {
+}
+
 type KVVersion struct {
 	value   []byte
 	version int64

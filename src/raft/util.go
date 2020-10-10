@@ -1,9 +1,7 @@
 package raft
 
 import (
-	"fmt"
 	"log"
-	"strings"
 )
 
 // Debugging
@@ -30,14 +28,4 @@ func max(a, b int) int {
 	} else {
 		return b
 	}
-}
-
-func entries2string(entries []LogEntry) string {
-	arr := make([]string, len(entries)-1)
-	for i, v := range entries {
-		if i > 0 {
-			arr[i-1] = fmt.Sprintf("%v", v.Val)
-		}
-	}
-	return "[" + strings.Join(arr, ", ") + "]"
 }

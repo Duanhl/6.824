@@ -31,7 +31,7 @@ import (
 // import "labgob"
 
 //
-// as each Raft peer becomes aware that successive log entries are
+// as each Raft peer becomes aware that successive log Entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same from, via the applyCh passed to Make(). set
 // CommandValid to true to indicate that the ApplyMsg contains a newly
@@ -66,13 +66,12 @@ type Raft struct {
 	votedFor    int
 	myVote      int
 	quorum      int
-	logs        []LogEntry
-	servState   ServState
+
+	logs      *RaftLog
+	servState ServState
 
 	//volatile state
-	commitIndex int
-	lastApplied int
-	applyChan   chan ApplyMsg
+	applyChan chan ApplyMsg
 
 	nextIdxs  []int
 	matchIdxs []int
@@ -107,49 +106,6 @@ const (
 
 const Non int = -1
 
-func (rf *Raft) lastEntryInfo() (int, int) {
-	return len(rf.logs) - 1, rf.logs[len(rf.logs)-1].Term
-}
-
-func (rf *Raft) upToDate(otherTerm int, otherIdx int) bool {
-	lastIdx, lastTerm := rf.lastEntryInfo()
-	return lastTerm > otherTerm ||
-		(lastTerm == otherTerm && lastIdx > otherIdx)
-}
-
-func (rf *Raft) entryMatched(otherTerm int, otherIdx int) bool {
-	return otherIdx < len(rf.logs) && rf.logs[otherIdx].Term == otherTerm
-}
-
-func (rf *Raft) findFirstIndexInTerm(otherTerm int) int {
-	index := -1
-	for i := len(rf.logs) - 1; i > -1; i-- {
-		if rf.logs[i].Term == otherTerm {
-			index = i
-		} else if rf.logs[i].Term < otherTerm {
-			break
-		}
-	}
-	if index > -1 {
-		return index
-	} else {
-		return rf.findFirstIndexInTerm(otherTerm - 1)
-	}
-}
-
-func (rf *Raft) appendLogs(begin int, entries []LogEntry) {
-	if len(entries) == 0 {
-		rf.logs = rf.logs[:begin]
-	} else {
-		rf.logs = append(rf.logs[:begin], entries...)
-	}
-}
-
-type LogEntry struct {
-	Val  interface{}
-	Term int
-}
-
 //add to proc channel
 type Msg struct {
 	msgType MsgType
@@ -164,7 +120,7 @@ type Msg struct {
 	logTerm  int
 
 	command interface{}
-	entries []LogEntry
+	entries []Entry
 
 	result bool
 
@@ -215,8 +171,6 @@ func (rf *Raft) persist() {
 
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
-	e.Encode(rf.commitIndex)
-	e.Encode(rf.lastApplied)
 	e.Encode(rf.logs)
 
 	data := w.Bytes()
@@ -248,20 +202,15 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var term int
 	var voteFor int
-	var commitIndex int
-	var lastApplied int
-	var logs []LogEntry
+	var logs *RaftLog
 	if d.Decode(&term) != nil ||
 		d.Decode(&voteFor) != nil ||
-		d.Decode(&commitIndex) != nil ||
-		d.Decode(&lastApplied) != nil ||
 		d.Decode(&logs) != nil {
 		return
 	}
 	rf.currentTerm = term
 	rf.votedFor = voteFor
-	rf.commitIndex = commitIndex
-	rf.lastApplied = lastApplied
+
 	rf.logs = logs
 }
 
@@ -318,7 +267,7 @@ type AppendEntriesArgs struct {
 	LeaderId     int
 	PrevLogIndex int
 	PrevLogTerm  int
-	Entries      []LogEntry
+	Entries      []Entry
 	LeaderCommit int
 }
 
@@ -492,13 +441,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.myVote = 0
 	rf.quorum = len(rf.peers)>>1 + 1
 
-	rf.logs = append(make([]LogEntry, 0), LogEntry{
-		Val:  nil,
-		Term: 0,
-	})
+	rf.logs = NewRaftLog()
 
-	rf.commitIndex = 0
-	rf.lastApplied = 0
 	rf.applyChan = applyCh
 
 	rf.nextIdxs = make([]int, len(peers))
@@ -550,21 +494,18 @@ func (rf *Raft) run() {
 }
 
 func (rf *Raft) apply() {
-	if rf.lastApplied < rf.commitIndex {
-		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-			log := rf.logs[i]
+	entries := rf.logs.UnApplied()
+	if len(entries) > 0 {
+		for i := 0; i < len(entries); i++ {
 			rf.applyChan <- ApplyMsg{
 				CommandValid: true,
-				Command:      log.Val,
-				CommandIndex: i,
+				Command:      entries[i].Val,
+				CommandIndex: entries[i].Index,
 			}
+			rf.logs.AppliedIndex = entries[i].Index
 		}
-		rf.lastApplied = rf.commitIndex
-		rf.persist()
-
-		lastIdx, lastTerm := rf.lastEntryInfo()
-		DPrintf("server %v apply logs, now logs: (%v, %v)", rf.me, lastTerm, lastIdx)
 	}
+	rf.persist()
 }
 
 func (rf *Raft) stepVoteReq(msg Msg) {
@@ -583,7 +524,7 @@ func (rf *Raft) stepVoteReq(msg Msg) {
 	}
 
 	if rf.votedFor == Non &&
-		!rf.upToDate(msg.logTerm, msg.logIndex) {
+		!rf.logs.IsUpToDate(msg.logIndex, msg.logTerm) {
 
 		rf.votedFor = msg.from
 		rf.elecElapsed = 0
@@ -636,7 +577,7 @@ func (rf *Raft) stepAppendReq(msg Msg) {
 	}
 
 	rf.elecElapsed = 0
-	if !rf.entryMatched(msg.logTerm, msg.logIndex) {
+	if !rf.logs.Matched(msg.logIndex, msg.logTerm) {
 		rf.send(Msg{
 			msgType: AppRes,
 			term:    rf.currentTerm,
@@ -645,17 +586,17 @@ func (rf *Raft) stepAppendReq(msg Msg) {
 			resc:    msg.resc,
 		})
 	} else {
-		rf.appendLogs(msg.logIndex+1, msg.entries)
+		rf.logs.AppendEntries(msg.logIndex+1, msg.entries)
 		rf.send(Msg{
 			msgType:  AppRes,
 			term:     rf.currentTerm,
-			logIndex: len(rf.logs) - 1,
+			logIndex: len(rf.logs.Entries) - 1,
 			result:   true,
 			resc:     msg.resc,
 		})
 
-		if msg.leaderCommit > rf.commitIndex {
-			rf.commitIndex = min(msg.leaderCommit, len(rf.logs)-1)
+		if msg.leaderCommit > rf.logs.CommitIndex {
+			rf.logs.CommitIndex = min(msg.leaderCommit, len(rf.logs.Entries)-1)
 		}
 		rf.apply()
 	}
@@ -671,7 +612,7 @@ func (rf *Raft) stepAppendReply(msg Msg) {
 		rf.matchIdxs[msg.from] = msg.logIndex
 		rf.nextIdxs[msg.from] = msg.logIndex + 1
 
-		if msg.logIndex > rf.commitIndex {
+		if msg.logIndex > rf.logs.CommitIndex {
 			match := 1
 			for i := 0; i < len(rf.peers); i++ {
 				if i != rf.me && rf.matchIdxs[i] >= msg.logIndex {
@@ -679,8 +620,8 @@ func (rf *Raft) stepAppendReply(msg Msg) {
 				}
 			}
 			if match >= rf.quorum {
-				DPrintf("leader %v update commitIndex from %v to %v", rf.me, rf.commitIndex, msg.logIndex)
-				rf.commitIndex = msg.logIndex
+				DPrintf("leader %v update CommitIndex from %v to %v", rf.me, rf.logs.CommitIndex, msg.logIndex)
+				rf.logs.CommitIndex = msg.logIndex
 				rf.apply()
 			}
 		}
@@ -688,7 +629,7 @@ func (rf *Raft) stepAppendReply(msg Msg) {
 		// republic log failed, next decrement
 		DPrintf("follower %v reject leader %v 's log", msg.from, rf.me)
 
-		prevIndex := rf.findFirstIndexInTerm(msg.logTerm - 1)
+		prevIndex := rf.logs.FindFirstIndexInTerm(msg.logTerm - 1)
 		rf.nextIdxs[msg.from] = max(prevIndex, 1)
 		rf.republicLog(msg.from)
 	}
@@ -708,19 +649,17 @@ func (rf *Raft) stepCommand(msg Msg) {
 			resc:     msg.resc,
 		})
 	} else {
-		rf.logs = append(rf.logs, LogEntry{
-			Val:  msg.command,
+		index := rf.logs.Append(Entry{
+			Type: "",
 			Term: rf.currentTerm,
+			Val:  msg.command,
 		})
 
-		lastIdx, lastTerm := rf.lastEntryInfo()
-		DPrintf("Leader %v(term: %v) step command, logs: (%v, %v)",
-			rf.me, rf.currentTerm, lastTerm, lastIdx)
 		rf.send(Msg{
 			msgType:  CommandRes,
 			state:    rf.servState,
 			term:     rf.currentTerm,
-			logIndex: len(rf.logs) - 1,
+			logIndex: index,
 			resc:     msg.resc,
 		})
 	}
@@ -760,10 +699,10 @@ func (rf *Raft) becomeLeader() {
 	rf.hbElapsed = rf.hbTimeout + 1
 	rf.myVote = 0
 
-	lastIdx, _ := rf.lastEntryInfo()
+	last := rf.logs.LastEntry()
 	for i := 0; i < len(rf.peers); i++ {
 		rf.matchIdxs[i] = 0
-		rf.nextIdxs[i] = lastIdx + 1
+		rf.nextIdxs[i] = last.Index + 1
 	}
 
 	DPrintf("candidate %v convert to leader, currentTerm: %v", rf.me, rf.currentTerm)
@@ -776,14 +715,11 @@ func (rf *Raft) becomeCandidate() {
 	rf.myVote = 1
 	rf.elecElapsed = 0
 
-	lastIdx, lastTerm := rf.lastEntryInfo()
-	DPrintf("server %v convert to candidate, currentTerm: %v, lastLogInfo:(%v, %v)",
-		rf.me, rf.currentTerm, lastTerm, lastIdx)
 	rf.requestForVote()
 }
 
 func (rf *Raft) requestForVote() {
-	lidx, lterm := rf.lastEntryInfo()
+	last := rf.logs.LastEntry()
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			rf.send(Msg{
@@ -791,8 +727,8 @@ func (rf *Raft) requestForVote() {
 				from:     rf.me,
 				to:       i,
 				term:     rf.currentTerm,
-				logIndex: lidx,
-				logTerm:  lterm,
+				logIndex: last.Index,
+				logTerm:  last.Term,
 			})
 		}
 	}
@@ -808,18 +744,18 @@ func (rf *Raft) republic() {
 
 func (rf *Raft) republicLog(server int) {
 	nextIdx := rf.nextIdxs[server]
-	lastLogIdx, lastLogTerm := rf.lastEntryInfo()
+	last := rf.logs.LastEntry()
 	var prevLogIndex, prevLogTerm int
-	var entries []LogEntry
+	var entries []Entry
 
-	if nextIdx > lastLogIdx {
-		prevLogIndex = lastLogIdx
-		prevLogTerm = lastLogTerm
+	if nextIdx > last.Index {
+		prevLogIndex = last.Index
+		prevLogTerm = last.Term
 		entries = nil
 	} else {
 		prevLogIndex = nextIdx - 1
-		prevLogTerm = rf.logs[nextIdx-1].Term
-		entries = rf.logs[nextIdx:]
+		prevLogTerm = rf.logs.Entries[nextIdx-1].Term
+		entries = rf.logs.Entries[nextIdx:]
 	}
 
 	rf.send(Msg{
@@ -827,7 +763,7 @@ func (rf *Raft) republicLog(server int) {
 		from:         rf.me,
 		to:           server,
 		term:         rf.currentTerm,
-		leaderCommit: rf.commitIndex,
+		leaderCommit: rf.logs.CommitIndex,
 		logIndex:     prevLogIndex,
 		logTerm:      prevLogTerm,
 		entries:      entries,

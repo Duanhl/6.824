@@ -70,7 +70,7 @@ func spawn_clients_and_wait(t *testing.T, cfg *config, ncli int, fn func(me int,
 	}
 }
 
-// predict effect of Append(k, val) if old value is prev.
+// predict effect of AppendEntries(k, val) if old value is prev.
 func NextValue(prev string, val string) string {
 	return prev + val
 }
@@ -83,14 +83,14 @@ func checkClntAppends(t *testing.T, clnt int, v string, count int) {
 		wanted := "x " + strconv.Itoa(clnt) + " " + strconv.Itoa(j) + " y"
 		off := strings.Index(v, wanted)
 		if off < 0 {
-			t.Fatalf("%v missing element %v in Append result %v", clnt, wanted, v)
+			t.Fatalf("%v missing element %v in AppendEntries result %v", clnt, wanted, v)
 		}
 		off1 := strings.LastIndex(v, wanted)
 		if off1 != off {
-			t.Fatalf("duplicate element %v in Append result", wanted)
+			t.Fatalf("duplicate element %v in AppendEntries result", wanted)
 		}
 		if off <= lastoff {
-			t.Fatalf("wrong order for element %v in Append result", wanted)
+			t.Fatalf("wrong order for element %v in AppendEntries result", wanted)
 		}
 		lastoff = off
 	}
@@ -106,14 +106,14 @@ func checkConcurrentAppends(t *testing.T, v string, counts []int) {
 			wanted := "x " + strconv.Itoa(i) + " " + strconv.Itoa(j) + " y"
 			off := strings.Index(v, wanted)
 			if off < 0 {
-				t.Fatalf("%v missing element %v in Append result %v", i, wanted, v)
+				t.Fatalf("%v missing element %v in AppendEntries result %v", i, wanted, v)
 			}
 			off1 := strings.LastIndex(v, wanted)
 			if off1 != off {
-				t.Fatalf("duplicate element %v in Append result", wanted)
+				t.Fatalf("duplicate element %v in AppendEntries result", wanted)
 			}
 			if off <= lastoff {
-				t.Fatalf("wrong order for element %v in Append result", wanted)
+				t.Fatalf("wrong order for element %v in AppendEntries result", wanted)
 			}
 			lastoff = off
 		}
@@ -142,7 +142,7 @@ func partitioner(t *testing.T, cfg *config, ch chan bool, done *int32) {
 	}
 }
 
-// Basic test is as follows: one or more clients submitting Append/Get
+// Basic test is as follows: one or more clients submitting AppendEntries/Get
 // operations to set of servers for some period of time.  After the period is
 // over, test checks that all appended values are present and in order for a
 // particular key.  If unreliable is set, RPCs may fail.  If crash is set, the
