@@ -29,3 +29,25 @@ func max(a, b int) int {
 		return b
 	}
 }
+
+type Wait struct {
+	ttype string
+	msg   interface{}
+	resc  chan interface{}
+}
+
+func NewWait(ttype string, msg interface{}) Wait {
+	return Wait{
+		ttype: ttype,
+		msg:   msg,
+		resc:  make(chan interface{}),
+	}
+}
+
+func (wait *Wait) wait() interface{} {
+	return <-wait.resc
+}
+
+func (wait *Wait) set(res interface{}) {
+	wait.resc <- res
+}

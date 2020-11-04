@@ -82,18 +82,17 @@ type Raft struct {
 	//for election
 	elecTimeout int64
 	hbTimeout   int64
-	elecElapsed int64
-	hbElapsed   int64
-	elecTicker  *time.Ticker
+	elapsed     int64
+	timec       chan struct{}
 }
 
 const (
-	ElectionPeriod  int64 = 50
-	HeartbeatPeriod       = 6
+	ElectionPeriod  int64 = 250
+	HeartbeatPeriod       = 30
 )
 
 const (
-	Heartbeat time.Duration = 5 * time.Millisecond
+	Mill time.Duration = time.Millisecond
 )
 
 type ServState int
@@ -104,7 +103,7 @@ const (
 	Follower            = 2
 )
 
-const Non int = -1
+const None int = -1
 
 //add to proc channel
 type Msg struct {
@@ -437,7 +436,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.servState = Follower
 	rf.currentTerm = 0
-	rf.votedFor = Non
+	rf.votedFor = None
 	rf.myVote = 0
 	rf.quorum = len(rf.peers)>>1 + 1
 
@@ -453,14 +452,22 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.elecTimeout = ElectionPeriod + rand.Int63n(ElectionPeriod)
 	rf.hbTimeout = HeartbeatPeriod + rand.Int63n(HeartbeatPeriod)
-	rf.elecElapsed = 0
-	rf.hbElapsed = 0
-	rf.elecTicker = time.NewTicker(Heartbeat)
+	rf.elapsed = 0
+	rf.timec = make(chan struct{}, 128)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	go rf.run()
+	go func() {
+		ticker := time.NewTicker(Mill)
+		for {
+			select {
+			case <-ticker.C:
+				rf.timec <- struct{}{}
+			}
+		}
+	}()
 
 	return rf
 }
@@ -468,7 +475,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 func (rf *Raft) run() {
 	for {
 		select {
-		case <-rf.elecTicker.C:
+		case <-rf.timec:
 			rf.dealTick()
 		case msg := <-rf.procc:
 			if msg.term > rf.currentTerm {
@@ -523,11 +530,11 @@ func (rf *Raft) stepVoteReq(msg Msg) {
 		return
 	}
 
-	if rf.votedFor == Non &&
+	if rf.votedFor == None &&
 		!rf.logs.IsUpToDate(msg.logIndex, msg.logTerm) {
 
 		rf.votedFor = msg.from
-		rf.elecElapsed = 0
+		rf.elapsed = 0
 		rf.send(Msg{
 			msgType: VoteRes,
 			term:    rf.currentTerm,
@@ -551,7 +558,7 @@ func (rf *Raft) stepVoteRes(msg Msg) {
 		return
 	}
 
-	rf.elecElapsed = 0
+	rf.elapsed = 0
 	if msg.result {
 		rf.myVote++
 	}
@@ -576,7 +583,7 @@ func (rf *Raft) stepAppendReq(msg Msg) {
 		return
 	}
 
-	rf.elecElapsed = 0
+	rf.elapsed = 0
 	if !rf.logs.Matched(msg.logIndex, msg.logTerm) {
 		rf.send(Msg{
 			msgType: AppRes,
@@ -666,24 +673,26 @@ func (rf *Raft) stepCommand(msg Msg) {
 }
 
 func (rf *Raft) dealTick() {
-	rf.elecElapsed++
-	rf.hbElapsed++
+	rf.elapsed++
 
-	if rf.elecElapsed > rf.elecTimeout && rf.servState != Leader {
-		rf.becomeCandidate()
-	}
-	if rf.hbElapsed > rf.hbTimeout && rf.servState == Leader {
-		rf.republic()
-		rf.hbElapsed = 0
+	if rf.servState == Leader {
+		if rf.elapsed > rf.hbTimeout {
+			rf.elapsed = 0
+			rf.republic()
+		}
+	} else {
+		if rf.elapsed > rf.elecTimeout {
+			rf.elapsed = 0
+			rf.becomeCandidate()
+		}
 	}
 }
 
 func (rf *Raft) becomeFollower(term int) {
 	rf.updateTerm(term)
 	rf.servState = Follower
-	rf.votedFor = Non
-	rf.elecElapsed = 0
-	rf.hbElapsed = 0
+	rf.votedFor = None
+	rf.elapsed = 0
 }
 
 func (rf *Raft) updateTerm(term int) {
@@ -695,8 +704,7 @@ func (rf *Raft) updateTerm(term int) {
 
 func (rf *Raft) becomeLeader() {
 	rf.servState = Leader
-	rf.elecElapsed = 0
-	rf.hbElapsed = rf.hbTimeout + 1
+	rf.elapsed = rf.hbTimeout + 1
 	rf.myVote = 0
 
 	last := rf.logs.LastEntry()
@@ -713,7 +721,6 @@ func (rf *Raft) becomeCandidate() {
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	rf.myVote = 1
-	rf.elecElapsed = 0
 
 	rf.requestForVote()
 }
