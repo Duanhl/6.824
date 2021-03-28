@@ -1,23 +1,12 @@
-package raftkv
+package kvraft
 
-import (
-	"labrpc"
-	"time"
-)
-import "sync"
+import "6.824/labrpc"
 import "crypto/rand"
 import "math/big"
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
-
-	leader  int
-	lock    *sync.Mutex
-	reqBuf  chan Args
-	resBuf  chan Reply
-	resChan map[int64]chan Reply
-	ticker  *time.Ticker
 }
 
 func nrand() int64 {
@@ -31,8 +20,6 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
-
-	ck.leader = 0
 	return ck
 }
 
@@ -72,38 +59,5 @@ func (ck *Clerk) Put(key string, value string) {
 	ck.PutAppend(key, value, "Put")
 }
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, "AppendEntries")
-}
-
-func (ck *Clerk) mainLoop() {
-	for {
-		select {
-		case <-ck.ticker.C:
-			for args := range ck.reqBuf {
-				ck.sendRequest(args)
-			}
-			break
-		case res := <-ck.resBuf:
-			if resCh, ok := ck.resChan[res.Id]; ok {
-				resCh <- res
-				delete(ck.resChan, res.Id)
-			}
-			DPrintf("Error found no resChan, res: %v", res)
-		}
-	}
-}
-
-func (ck *Clerk) sendRequest(args Args) {
-	switch args.Op {
-	case Get:
-		getArgs := &GetArgs{Key: args.Key}
-		getReply := &GetReply{}
-		if ok := ck.servers[ck.leader].Call("KVServer.Get", &getArgs, &getReply); ok {
-
-		} else {
-			time.AfterFunc(time.Duration(50), func() {
-				ck.sendRequest(args)
-			})
-		}
-	}
+	ck.PutAppend(key, value, "Append")
 }

@@ -49,7 +49,7 @@ package labrpc
 //   pass svc to srv.AddService()
 //
 
-import "labgob"
+import "6.824/labgob"
 import "bytes"
 import "reflect"
 import "sync"
@@ -90,7 +90,9 @@ func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bo
 
 	qb := new(bytes.Buffer)
 	qe := labgob.NewEncoder(qb)
-	qe.Encode(args)
+	if err := qe.Encode(args); err != nil {
+		panic(err)
+	}
 	req.args = qb.Bytes()
 
 	//
@@ -262,7 +264,7 @@ func (rn *Network) processReq(req reqMsg) {
 		// do not reply if DeleteServer() has been called, i.e.
 		// the server has been killed. this is needed to avoid
 		// situation in which a client gets a positive reply
-		// to an AppendEntries, but the server persisted the update
+		// to an Append, but the server persisted the update
 		// into the old Persister. config.go is careful to call
 		// DeleteServer() before superseding the Persister.
 		serverDead = rn.isServerDead(req.endname, servername, server)

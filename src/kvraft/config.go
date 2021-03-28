@@ -1,6 +1,6 @@
-package raftkv
+package kvraft
 
-import "labrpc"
+import "6.824/labrpc"
 import "testing"
 import "os"
 
@@ -11,7 +11,7 @@ import "math/rand"
 import "encoding/base64"
 import "sync"
 import "runtime"
-import "raft"
+import "6.824/raft"
 import "fmt"
 import "time"
 import "sync/atomic"
@@ -262,7 +262,7 @@ func (cfg *config) ShutdownServer(i int) {
 	// it's important to do this before creating
 	// the new Persister in saved[i], to avoid
 	// the possibility of the server returning a
-	// positive reply to an AppendEntries but persisting
+	// positive reply to an Append but persisting
 	// the result in the superseded Persister.
 	cfg.net.DeleteServer(i)
 

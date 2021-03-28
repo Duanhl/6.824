@@ -1,19 +1,18 @@
-package raftkv
+package kvraft
 
 import (
-	"labgob"
-	"labrpc"
+	"6.824/labgob"
+	"6.824/labrpc"
+	"6.824/raft"
 	"log"
-	"raft"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
-const Debug = 0
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug > 0 {
+	if Debug {
 		log.Printf(format, a...)
 	}
 	return
@@ -23,10 +22,6 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Key    string
-	Value  string
-	OpType string //"Get", "Put", "AppendEntries"
-	Id     int64
 }
 
 type KVServer struct {
@@ -39,55 +34,14 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	store      map[string]string
-	reqBuf     chan Op
-	resChStore map[int64]chan Reply
-	ticker     *time.Ticker
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	op := Op{
-		Key:    args.Key,
-		Value:  "",
-		OpType: "Get",
-		Id:     args.Id,
-	}
-
-	resCh := make(chan Reply)
-
-	kv.command(op, resCh)
-
-	for {
-		select {
-		case res := <-resCh:
-			reply.Err = res.Err
-			reply.Value = res.Value
-			return
-		}
-	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	op := Op{
-		Key:    args.Key,
-		Value:  args.Value,
-		OpType: args.Op,
-		Id:     args.Id,
-	}
-
-	resCh := make(chan Reply)
-
-	kv.command(op, resCh)
-
-	for {
-		select {
-		case res := <-resCh:
-			reply.Err = res.Err
-			return
-		}
-	}
 }
 
 //
@@ -140,75 +94,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-	kv.store = make(map[string]string)
-	kv.reqBuf = make(chan Op)
-	kv.resChStore = make(map[int64]chan Reply)
-
-	go kv.run()
 
 	return kv
-}
-
-func (kv *KVServer) run() {
-	for {
-		select {
-		case applyMsg := <-kv.applyCh:
-			kv.dealApply(applyMsg)
-		case op := <-kv.reqBuf:
-			_, _, isLeader := kv.rf.Start(op)
-			if !isLeader {
-				kv.replyToClient(Reply{
-					Err: ErrWrongLeader,
-				})
-			}
-		}
-	}
-}
-
-func (kv *KVServer) dealApply(applyMsg raft.ApplyMsg) {
-
-	switch applyMsg.Command.(type) {
-	case Op:
-		op := applyMsg.Command.(Op)
-		switch op.OpType {
-		case "Get":
-			if v, ok := kv.store[op.Key]; ok {
-				kv.replyToClient(Reply{
-					Value: v,
-				})
-			} else {
-				kv.replyToClient(Reply{
-					Err: ErrNoKey,
-				})
-			}
-			break
-		case "Put":
-			kv.store[op.Key] = op.Value
-			kv.replyToClient(Reply{})
-			break
-		case "AppendEntries":
-			if v, ok := kv.store[op.Key]; ok {
-				kv.store[op.Key] += v
-			} else {
-				kv.store[op.Key] = op.Value
-			}
-			kv.replyToClient(Reply{})
-			break
-		}
-		break
-	default:
-		DPrintf("wrong apply type,: %v", applyMsg)
-	}
-}
-
-func (kv *KVServer) command(op Op, ch chan Reply) {
-	kv.reqBuf <- op
-	kv.resChStore[op.Id] = ch
-}
-
-func (kv *KVServer) replyToClient(reply Reply) {
-	if v, ok := kv.resChStore[reply.Id]; ok {
-		v <- reply
-		delete(kv.resChStore, reply.Id)
-	}
 }
