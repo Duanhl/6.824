@@ -18,6 +18,9 @@ package raft
 //
 
 import (
+	"math/rand"
+	"time"
+
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -49,6 +52,16 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type ServerState int32
+
+const (
+	Follower  ServerState = 0
+	Candidate ServerState = 1
+	Leader    ServerState = 2
+)
+
+const None int = -1
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -62,7 +75,40 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	ps    PersistentState
+	vs    VolatileState
+	state ServerState
 
+	applyCh chan ApplyMsg
+	msgCh   chan Message
+	resMap  map[int64]chan Message
+
+	tickCh          chan interface{}
+	electionTimeout int64
+	republicTimeout int64
+	elapsed         int64
+}
+
+type PersistentState struct {
+	CurrentTerm int
+	VoteFor     int
+	Logs        []LogEntry
+}
+
+func (ps *PersistentState) lastLogIndex() int {
+	return len(ps.Logs) - 1
+}
+
+func (ps *PersistentState) lastLogTerm() int {
+	return ps.Logs[len(ps.Logs)-1].Term
+}
+
+type VolatileState struct {
+	commitIdx   int
+	lastApplied int64
+	nextIdx     []int
+	matchIdx    []int
+	qurom       int
 }
 
 // return currentTerm and whether this server
@@ -72,6 +118,9 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	term = rf.ps.CurrentTerm
+	isleader = rf.state == Leader
+
 	return term, isleader
 }
 
@@ -133,12 +182,31 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
+var IDGenerator int64 = 0
+
+func (rf *Raft) waitForRes(msg Message) Message {
+	ch := make(chan Message)
+	id := atomic.AddInt64(&IDGenerator, 1)
+	rf.resMap[id] = ch
+	msg.Id = id
+	rf.msgCh <- msg
+
+	select {
+	case res := <-ch:
+		return res
+	}
+}
+
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -147,6 +215,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -154,6 +224,16 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	msg := rf.waitForRes(Message{
+		MType:       MsgVoteRequest,
+		From:        args.CandidateId,
+		To:          rf.me,
+		Term:        args.Term,
+		PrevLogIdx:  args.LastLogIndex,
+		PrevLogTerm: args.LastLogTerm,
+	})
+	reply.Term = msg.Term
+	reply.VoteGranted = msg.Agreed
 }
 
 //
@@ -187,6 +267,40 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	msg := rf.waitForRes(Message{
+		MType:        MsgAppendRequest,
+		From:         args.LeaderId,
+		To:           rf.me,
+		Term:         args.Term,
+		PrevLogIdx:   args.PrevLogIndex,
+		PrevLogTerm:  args.PrevLogTerm,
+		Entries:      args.Entries,
+		LeaderCommit: args.LeaderCommit,
+	})
+	reply.Term = msg.Term
+	reply.Success = msg.Agreed
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
@@ -238,12 +352,30 @@ func (rf *Raft) killed() bool {
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
+	ch := time.Tick(time.Millisecond)
 	for rf.killed() == false {
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
+		select {
+		case <-ch:
+			rf.tickCh <- struct{}{}
+		}
+	}
 
+}
+
+func (rf *Raft) tick() {
+	rf.elapsed++
+
+	if rf.elapsed > rf.electionTimeout && rf.state != Leader {
+		rf.becomeCandidate()
+	}
+
+	if rf.elapsed > rf.republicTimeout && rf.state == Leader {
+		rf.republic()
+		rf.elapsed = 0
 	}
 }
 
@@ -266,12 +398,263 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	logs := make([]LogEntry, 1)
+	logs = append(logs, LogEntry{
+		Bytes: nil,
+		Term:  0,
+		Index: 0,
+	})
+	rf.ps = PersistentState{
+		CurrentTerm: 0,
+		VoteFor:     None,
+		Logs:        logs,
+	}
+	rf.vs = VolatileState{
+		commitIdx:   0,
+		lastApplied: 0,
+		nextIdx:     make([]int, len(rf.peers)),
+		matchIdx:    make([]int, len(rf.peers)),
+	}
+	rf.state = Follower
+
+	rf.applyCh = applyCh
+	rf.msgCh = make(chan Message, 128)
+	rf.resMap = make(map[int64]chan Message)
+
+	rf.tickCh = make(chan interface{}, 128)
+	rf.electionTimeout = 100 + rand.Int63n(200)
+	rf.republicTimeout = rf.electionTimeout / 3
+	rf.elapsed = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.mainLoop()
 
 	return rf
+}
+
+func (rf *Raft) mainLoop() {
+	for rf.killed() == false {
+		select {
+		case <-rf.tickCh:
+			rf.tick()
+		case msg := <-rf.msgCh:
+			rf.stepMessage(msg)
+		}
+	}
+}
+
+func (rf *Raft) stepMessage(msg Message) {
+	if msg.Term > rf.ps.CurrentTerm {
+		rf.becomeFollower(msg.Term)
+	}
+
+	if msg.To == rf.me {
+		switch msg.MType {
+		case MsgVoteRequest:
+			ch := rf.resMap[msg.Id]
+			delete(rf.resMap, msg.Id)
+			rf.stepVoteReq(msg, ch)
+		case MsgVoteResponse:
+			rf.stepVoteRes(msg)
+		case MsgAppendRequest:
+			ch := rf.resMap[msg.Id]
+			delete(rf.resMap, msg.Id)
+			rf.stepAppendReq(msg, ch)
+		case MsgAppendResponse:
+			rf.stepAppendRes(msg)
+		default:
+		}
+	}
+
+	if msg.From == rf.me {
+		rf.sendMsg(msg)
+	}
+}
+
+func (rf *Raft) stepVoteReq(msg Message, ch chan<- Message) {
+	if msg.Term < rf.ps.CurrentTerm {
+		ch <- Message{
+			Term:   rf.ps.CurrentTerm,
+			Agreed: false,
+		}
+	} else {
+		if rf.ps.VoteFor == None {
+			rf.ps.VoteFor = msg.From
+			rf.elapsed = 0
+			ch <- Message{
+				Term:   rf.ps.CurrentTerm,
+				Agreed: true,
+			}
+			DPrintf("follower %v vote for candidate %v in term: %v", rf.me, msg.From, rf.ps.CurrentTerm)
+		} else {
+			ch <- Message{
+				Term:   rf.ps.CurrentTerm,
+				Agreed: false,
+			}
+		}
+	}
+}
+
+func (rf *Raft) stepVoteRes(msg Message) {
+	if msg.Term == rf.ps.CurrentTerm && msg.Agreed {
+		rf.vs.qurom++
+	}
+
+	if rf.vs.qurom >= len(rf.peers)/2+1 && rf.state == Candidate {
+		DPrintf("candidate %v receive %v votes, become leader in term %v", rf.me, rf.vs.qurom, rf.ps.CurrentTerm)
+		rf.becomeLeader()
+	}
+}
+
+func (rf *Raft) stepAppendReq(msg Message, ch chan<- Message) {
+	if msg.Term < rf.ps.CurrentTerm {
+		ch <- Message{
+			Term:   rf.ps.CurrentTerm,
+			Agreed: false,
+		}
+	} else {
+		if rf.state == Candidate {
+			rf.becomeFollower(msg.Term)
+		}
+		rf.elapsed = 0
+		ch <- Message{
+			Term:   rf.ps.CurrentTerm,
+			Agreed: true,
+		}
+	}
+}
+
+func (rf *Raft) stepAppendRes(msg Message) {
+
+}
+
+func (rf *Raft) becomeFollower(term int) {
+	rf.elapsed = 0
+
+	rf.ps.CurrentTerm = term
+	rf.ps.VoteFor = None
+	rf.state = Follower
+}
+
+func (rf *Raft) becomeCandidate() {
+	rf.elapsed = 0
+	rf.electionTimeout = 100 + rand.Int63n(200)
+	rf.republicTimeout = rf.electionTimeout / 3
+
+	rf.ps.CurrentTerm += 1
+	rf.ps.VoteFor = rf.me
+	rf.vs.qurom = 1
+
+	rf.state = Candidate
+	for i := 0; i < len(rf.peers); i++ {
+		if rf.me != i {
+			rf.sendMsg(Message{
+				MType:       MsgVoteRequest,
+				From:        rf.me,
+				To:          i,
+				Term:        rf.ps.CurrentTerm,
+				PrevLogIdx:  rf.ps.lastLogIndex(),
+				PrevLogTerm: rf.ps.lastLogTerm(),
+			})
+		}
+	}
+	DPrintf("server %v become candidate, term: %v", rf.me, rf.ps.CurrentTerm)
+}
+
+func (rf *Raft) becomeLeader() {
+	rf.elapsed = rf.republicTimeout
+
+	rf.state = Leader
+	for i := 0; i < len(rf.peers); i++ {
+		rf.vs.nextIdx[i] = rf.ps.lastLogIndex() + 1
+		rf.vs.matchIdx[i] = 0
+	}
+}
+
+func (rf *Raft) republic() {
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me {
+			prevLogIdx := rf.vs.nextIdx[i] - 1
+			prevLogTerm := rf.ps.Logs[prevLogIdx].Term
+			var entries []LogEntry
+			if prevLogIdx == len(rf.ps.Logs)-1 {
+				entries = nil
+			} else {
+				entries = rf.ps.Logs[prevLogIdx+1:]
+			}
+			rf.sendMsg(Message{
+				MType:        MsgAppendRequest,
+				From:         rf.me,
+				To:           i,
+				Term:         rf.ps.CurrentTerm,
+				PrevLogIdx:   prevLogIdx,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      entries,
+				LeaderCommit: rf.vs.commitIdx,
+			})
+		}
+	}
+}
+
+func (rf *Raft) sendMsg(msg Message) {
+	if msg.From == rf.me {
+		switch msg.MType {
+		case MsgVoteRequest:
+			if rf.state == Candidate {
+				go func() {
+					reply := &RequestVoteReply{}
+					ok := rf.sendRequestVote(msg.To, &RequestVoteArgs{
+						Term:         msg.Term,
+						CandidateId:  rf.me,
+						LastLogIndex: msg.PrevLogIdx,
+						LastLogTerm:  msg.PrevLogTerm,
+					}, reply)
+					if !ok {
+						time.AfterFunc(5*time.Millisecond, func() {
+							rf.msgCh <- msg
+						})
+					} else {
+						rf.msgCh <- Message{
+							MType:  MsgVoteResponse,
+							From:   msg.To,
+							To:     rf.me,
+							Term:   reply.Term,
+							Agreed: reply.VoteGranted,
+						}
+					}
+				}()
+			}
+		case MsgAppendRequest:
+			if rf.state == Leader {
+				go func() {
+					reply := &AppendEntriesReply{}
+					ok := rf.sendAppendEntries(msg.To, &AppendEntriesArgs{
+						Term:         msg.Term,
+						LeaderId:     rf.me,
+						PrevLogIndex: msg.PrevLogIdx,
+						PrevLogTerm:  msg.PrevLogTerm,
+						Entries:      msg.Entries,
+						LeaderCommit: msg.LeaderCommit,
+					}, reply)
+					if !ok {
+						time.AfterFunc(10*time.Millisecond, func() {
+							rf.msgCh <- msg
+						})
+					} else {
+						rf.msgCh <- Message{
+							MType:  MsgAppendResponse,
+							From:   msg.To,
+							To:     rf.me,
+							Term:   reply.Term,
+							Agreed: reply.Success,
+						}
+					}
+				}()
+			}
+		}
+	}
 }
