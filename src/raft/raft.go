@@ -61,6 +61,7 @@ const (
 )
 
 const None int = -1
+const TickUnit = 5 * time.Millisecond
 
 //
 // A Go object implementing a single Raft peer.
@@ -89,6 +90,19 @@ type Raft struct {
 	elapsed         int64
 }
 
+func (rf *Raft) applyMsg() {
+	if rf.vs.commitIdx > rf.vs.lastApplied {
+		for i := rf.vs.lastApplied + 1; i <= rf.vs.commitIdx; i++ {
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      rf.ps.Logs[i].Command,
+				CommandIndex: rf.ps.Logs[i].Index,
+			}
+			rf.vs.lastApplied++
+		}
+	}
+}
+
 type PersistentState struct {
 	CurrentTerm int
 	VoteFor     int
@@ -103,12 +117,55 @@ func (ps *PersistentState) lastLogTerm() int {
 	return ps.Logs[len(ps.Logs)-1].Term
 }
 
+func (ps *PersistentState) appendCommand(command interface{}) (int, int) {
+	entry := LogEntry{
+		Command: command,
+		Term:    ps.CurrentTerm,
+		Index:   len(ps.Logs),
+	}
+	ps.Logs = append(ps.Logs, entry)
+	return entry.Index, entry.Term
+}
+
+func (ps *PersistentState) isUpToDate(otherLastTerm int, otherLastIndex int) bool {
+	lastIndex := ps.lastLogIndex()
+	lastTerm := ps.lastLogTerm()
+	return lastTerm > otherLastTerm ||
+		(lastTerm == otherLastTerm && lastIndex > otherLastIndex)
+}
+
+func (ps *PersistentState) match(otherTerm int, otherIndex int) bool {
+	if otherIndex >= len(ps.Logs) {
+		return false
+	}
+	return ps.Logs[otherIndex].Term == otherTerm
+}
+
+func (ps *PersistentState) appendLogs(entries []LogEntry) {
+	if len(entries) == 0 {
+		return
+	}
+	mMatch := -1
+	eMatch := 0
+	for i := 0; i < len(entries); i++ {
+		idx := entries[i].Index
+		if idx < len(ps.Logs) && ps.Logs[idx].Term != entries[i].Term {
+			mMatch = idx
+			eMatch = i
+			break
+		}
+	}
+	if mMatch > -1 {
+		ps.Logs = append(ps.Logs[:mMatch], entries[eMatch:]...)
+	}
+}
+
 type VolatileState struct {
 	commitIdx   int
-	lastApplied int64
+	lastApplied int
 	nextIdx     []int
 	matchIdx    []int
-	qurom       int
+	quorum      int
 }
 
 // return currentTerm and whether this server
@@ -186,7 +243,7 @@ var IDGenerator int64 = 0
 
 func (rf *Raft) waitForRes(msg Message) Message {
 	ch := make(chan Message)
-	id := atomic.AddInt64(&IDGenerator, 1)
+	id := int64(rf.me*1000000000) + atomic.AddInt64(&IDGenerator, 1)
 	rf.resMap[id] = ch
 	msg.Id = id
 	rf.msgCh <- msg
@@ -319,13 +376,17 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
 
 	// Your code here (2B).
+	msg := rf.waitForRes(Message{
+		MType:   MsgAppendCommand,
+		Command: command,
+		From:    -1,
+	})
 
-	return index, term, isLeader
+	isLeader := msg.PrevLogIdx != -1
+
+	return msg.PrevLogIdx, msg.PrevLogTerm, isLeader
 }
 
 //
@@ -342,6 +403,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	for _, v := range rf.resMap {
+		v <- Message{
+			Term:   rf.ps.CurrentTerm,
+			Agreed: false,
+		}
+	}
 }
 
 func (rf *Raft) killed() bool {
@@ -352,7 +419,7 @@ func (rf *Raft) killed() bool {
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
-	ch := time.Tick(time.Millisecond)
+	ch := time.Tick(TickUnit)
 	for rf.killed() == false {
 
 		// Your code here to check if a leader election should
@@ -374,7 +441,7 @@ func (rf *Raft) tick() {
 	}
 
 	if rf.elapsed > rf.republicTimeout && rf.state == Leader {
-		rf.republic()
+		rf.distribute()
 		rf.elapsed = 0
 	}
 }
@@ -400,9 +467,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	logs := make([]LogEntry, 1)
 	logs = append(logs, LogEntry{
-		Bytes: nil,
-		Term:  0,
-		Index: 0,
+		Command: nil,
+		Term:    0,
+		Index:   0,
 	})
 	rf.ps = PersistentState{
 		CurrentTerm: 0,
@@ -422,7 +489,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.resMap = make(map[int64]chan Message)
 
 	rf.tickCh = make(chan interface{}, 128)
-	rf.electionTimeout = 100 + rand.Int63n(200)
+	rf.electionTimeout = 30 + rand.Int63n(30)
 	rf.republicTimeout = rf.electionTimeout / 3
 	rf.elapsed = 0
 
@@ -473,6 +540,18 @@ func (rf *Raft) stepMessage(msg Message) {
 	if msg.From == rf.me {
 		rf.sendMsg(msg)
 	}
+
+	// local msg
+	if msg.From == -1 {
+		switch msg.MType {
+		case MsgAppendCommand:
+			ch := rf.resMap[msg.Id]
+			delete(rf.resMap, msg.Id)
+			rf.stepAddCommand(msg, ch)
+		default:
+
+		}
+	}
 }
 
 func (rf *Raft) stepVoteReq(msg Message, ch chan<- Message) {
@@ -482,7 +561,7 @@ func (rf *Raft) stepVoteReq(msg Message, ch chan<- Message) {
 			Agreed: false,
 		}
 	} else {
-		if rf.ps.VoteFor == None {
+		if rf.ps.VoteFor == None && !rf.ps.isUpToDate(msg.PrevLogTerm, msg.PrevLogIdx) {
 			rf.ps.VoteFor = msg.From
 			rf.elapsed = 0
 			ch <- Message{
@@ -500,12 +579,13 @@ func (rf *Raft) stepVoteReq(msg Message, ch chan<- Message) {
 }
 
 func (rf *Raft) stepVoteRes(msg Message) {
-	if msg.Term == rf.ps.CurrentTerm && msg.Agreed {
-		rf.vs.qurom++
+	if msg.Term == rf.ps.CurrentTerm && msg.Agreed && rf.state == Candidate {
+		rf.elapsed = 0
+		rf.vs.quorum++
 	}
 
-	if rf.vs.qurom >= len(rf.peers)/2+1 && rf.state == Candidate {
-		DPrintf("candidate %v receive %v votes, become leader in term %v", rf.me, rf.vs.qurom, rf.ps.CurrentTerm)
+	if rf.vs.quorum >= len(rf.peers)/2+1 && rf.state == Candidate {
+		DPrintf("candidate %v receive %v votes, become leader in term %v", rf.me, rf.vs.quorum, rf.ps.CurrentTerm)
 		rf.becomeLeader()
 	}
 }
@@ -517,19 +597,49 @@ func (rf *Raft) stepAppendReq(msg Message, ch chan<- Message) {
 			Agreed: false,
 		}
 	} else {
-		if rf.state == Candidate {
-			rf.becomeFollower(msg.Term)
-		}
-		rf.elapsed = 0
-		ch <- Message{
-			Term:   rf.ps.CurrentTerm,
-			Agreed: true,
+		rf.becomeFollower(msg.Term)
+
+		if rf.ps.match(msg.PrevLogTerm, msg.PrevLogIdx) {
+			rf.ps.appendLogs(msg.Entries)
+			if msg.LeaderCommit > rf.vs.commitIdx {
+				rf.vs.commitIdx = Min(msg.LeaderCommit, rf.ps.lastLogIndex())
+				rf.applyMsg()
+			}
+		} else {
+			ch <- Message{
+				Term:   rf.ps.CurrentTerm,
+				Agreed: true,
+			}
 		}
 	}
 }
 
 func (rf *Raft) stepAppendRes(msg Message) {
+	if msg.Term == rf.ps.CurrentTerm && rf.state == Leader {
+		if msg.Agreed {
 
+		} else {
+			rf.vs.nextIdx[msg.From]--
+			rf.distributeLog(msg.From, false)
+		}
+	}
+}
+
+func (rf *Raft) stepAddCommand(msg Message, ch chan<- Message) {
+	if rf.state != Leader {
+		ch <- Message{
+			PrevLogIdx:  -1,
+			PrevLogTerm: -1,
+		}
+	} else {
+		lastIdx, lastTerm := rf.ps.appendCommand(msg.Command)
+		ch <- Message{
+			PrevLogIdx:  lastIdx,
+			PrevLogTerm: lastTerm,
+		}
+		// trigger distribute log entry
+		rf.elapsed = rf.republicTimeout
+	}
 }
 
 func (rf *Raft) becomeFollower(term int) {
@@ -542,12 +652,12 @@ func (rf *Raft) becomeFollower(term int) {
 
 func (rf *Raft) becomeCandidate() {
 	rf.elapsed = 0
-	rf.electionTimeout = 100 + rand.Int63n(200)
+	rf.electionTimeout = 30 + rand.Int63n(30)
 	rf.republicTimeout = rf.electionTimeout / 3
 
 	rf.ps.CurrentTerm += 1
 	rf.ps.VoteFor = rf.me
-	rf.vs.qurom = 1
+	rf.vs.quorum = 1
 
 	rf.state = Candidate
 	for i := 0; i < len(rf.peers); i++ {
@@ -566,37 +676,45 @@ func (rf *Raft) becomeCandidate() {
 }
 
 func (rf *Raft) becomeLeader() {
-	rf.elapsed = rf.republicTimeout
-
 	rf.state = Leader
 	for i := 0; i < len(rf.peers); i++ {
 		rf.vs.nextIdx[i] = rf.ps.lastLogIndex() + 1
 		rf.vs.matchIdx[i] = 0
 	}
+	rf.elapsed = rf.republicTimeout
 }
 
-func (rf *Raft) republic() {
+func (rf *Raft) distribute() {
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
-			prevLogIdx := rf.vs.nextIdx[i] - 1
-			prevLogTerm := rf.ps.Logs[prevLogIdx].Term
-			var entries []LogEntry
-			if prevLogIdx == len(rf.ps.Logs)-1 {
-				entries = nil
-			} else {
-				entries = rf.ps.Logs[prevLogIdx+1:]
-			}
-			rf.sendMsg(Message{
-				MType:        MsgAppendRequest,
-				From:         rf.me,
-				To:           i,
-				Term:         rf.ps.CurrentTerm,
-				PrevLogIdx:   prevLogIdx,
-				PrevLogTerm:  prevLogTerm,
-				Entries:      entries,
-				LeaderCommit: rf.vs.commitIdx,
-			})
+			rf.distributeLog(i, true)
 		}
+	}
+}
+
+func (rf *Raft) distributeLog(server int, sync bool) {
+	var entries []LogEntry
+	if rf.ps.lastLogIndex() >= rf.vs.nextIdx[server] {
+		entries = rf.ps.Logs[rf.vs.nextIdx[server]:]
+	} else {
+		entries = nil
+	}
+	prevLogIdx := rf.vs.nextIdx[server] - 1
+	prevLogTerm := rf.ps.Logs[prevLogIdx].Term
+	msg := Message{
+		MType:        MsgAppendRequest,
+		From:         rf.me,
+		To:           server,
+		Term:         rf.ps.CurrentTerm,
+		PrevLogIdx:   prevLogIdx,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: rf.vs.commitIdx,
+	}
+	if sync {
+		rf.sendMsg(msg)
+	} else {
+		rf.msgCh <- msg
 	}
 }
 
@@ -604,7 +722,7 @@ func (rf *Raft) sendMsg(msg Message) {
 	if msg.From == rf.me {
 		switch msg.MType {
 		case MsgVoteRequest:
-			if rf.state == Candidate {
+			if rf.state == Candidate && msg.Term == rf.ps.CurrentTerm {
 				go func() {
 					reply := &RequestVoteReply{}
 					ok := rf.sendRequestVote(msg.To, &RequestVoteArgs{
@@ -614,7 +732,7 @@ func (rf *Raft) sendMsg(msg Message) {
 						LastLogTerm:  msg.PrevLogTerm,
 					}, reply)
 					if !ok {
-						time.AfterFunc(5*time.Millisecond, func() {
+						time.AfterFunc(TickUnit, func() {
 							rf.msgCh <- msg
 						})
 					} else {
@@ -629,7 +747,7 @@ func (rf *Raft) sendMsg(msg Message) {
 				}()
 			}
 		case MsgAppendRequest:
-			if rf.state == Leader {
+			if rf.state == Leader && msg.Term == rf.ps.CurrentTerm {
 				go func() {
 					reply := &AppendEntriesReply{}
 					ok := rf.sendAppendEntries(msg.To, &AppendEntriesArgs{
@@ -641,7 +759,7 @@ func (rf *Raft) sendMsg(msg Message) {
 						LeaderCommit: msg.LeaderCommit,
 					}, reply)
 					if !ok {
-						time.AfterFunc(10*time.Millisecond, func() {
+						time.AfterFunc(TickUnit, func() {
 							rf.msgCh <- msg
 						})
 					} else {

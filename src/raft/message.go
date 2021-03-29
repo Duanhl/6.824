@@ -7,6 +7,8 @@ const (
 	MsgVoteResponse   MessageType = 2
 	MsgAppendRequest  MessageType = 3
 	MsgAppendResponse MessageType = 4
+
+	MsgAppendCommand MessageType = 5
 )
 
 type Message struct {
@@ -19,12 +21,13 @@ type Message struct {
 	PrevLogTerm  int
 	Entries      []LogEntry
 	LeaderCommit int
+	Command      interface{}
 
 	Agreed bool
 }
 
 type LogEntry struct {
-	Bytes []byte
-	Term  int
-	Index int
+	Command interface{}
+	Term    int
+	Index   int
 }
