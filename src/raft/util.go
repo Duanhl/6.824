@@ -1,6 +1,9 @@
 package raft
 
-import "log"
+import (
+	"log"
+	"sort"
+)
 
 // Debugging
 const Debug = true
@@ -17,4 +20,19 @@ func Min(a int, b int) int {
 		return a
 	}
 	return b
+}
+
+func Max(a int, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func Majority(arr []int) int {
+	quorum := (len(arr) - 1) / 2
+	target := make([]int, len(arr))
+	copy(target, arr)
+	sort.Ints(target)
+	return target[quorum]
 }

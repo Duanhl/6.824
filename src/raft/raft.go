@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.824/labgob"
+	"bytes"
 	"math/rand"
 	"time"
 
@@ -84,10 +86,10 @@ type Raft struct {
 	msgCh   chan Message
 	resMap  map[int64]chan Message
 
-	tickCh          chan interface{}
-	electionTimeout int64
-	republicTimeout int64
-	elapsed         int64
+	tickCh           chan interface{}
+	electionTimeout  int64
+	heartbeatTimeout int64
+	elapsed          int64
 }
 
 func (rf *Raft) applyMsg() {
@@ -100,6 +102,15 @@ func (rf *Raft) applyMsg() {
 			}
 			rf.vs.lastApplied++
 		}
+		DPrintf("server %v apply msg, lastLog:{%v, %v}", rf.me,
+			rf.ps.Logs[rf.vs.lastApplied].Term, rf.ps.Logs[rf.vs.lastApplied].Index)
+	}
+}
+
+func (rf *Raft) commit() {
+	mayCommitIdx := Majority(rf.vs.matchIdx)
+	if mayCommitIdx > rf.vs.commitIdx && rf.ps.Logs[mayCommitIdx].Term == rf.ps.CurrentTerm {
+		rf.vs.commitIdx = mayCommitIdx
 	}
 }
 
@@ -109,55 +120,68 @@ type PersistentState struct {
 	Logs        []LogEntry
 }
 
-func (ps *PersistentState) lastLogIndex() int {
-	return len(ps.Logs) - 1
+func (rf *Raft) lastLogIndex() int {
+	return len(rf.ps.Logs) - 1
 }
 
-func (ps *PersistentState) lastLogTerm() int {
-	return ps.Logs[len(ps.Logs)-1].Term
+func (rf *Raft) lastLogTerm() int {
+	return rf.ps.Logs[len(rf.ps.Logs)-1].Term
 }
 
-func (ps *PersistentState) appendCommand(command interface{}) (int, int) {
+func (rf *Raft) appendCommand(command interface{}) (int, int) {
 	entry := LogEntry{
 		Command: command,
-		Term:    ps.CurrentTerm,
-		Index:   len(ps.Logs),
+		Term:    rf.ps.CurrentTerm,
+		Index:   len(rf.ps.Logs),
 	}
-	ps.Logs = append(ps.Logs, entry)
+	rf.ps.Logs = append(rf.ps.Logs, entry)
+	rf.persist()
+	DPrintf("leader %v add command %v in log:{%v, %v}", rf.me, command,
+		rf.lastLogTerm(), rf.lastLogIndex())
 	return entry.Index, entry.Term
 }
 
-func (ps *PersistentState) isUpToDate(otherLastTerm int, otherLastIndex int) bool {
-	lastIndex := ps.lastLogIndex()
-	lastTerm := ps.lastLogTerm()
+func (rf *Raft) isUpToDate(otherLastTerm int, otherLastIndex int) bool {
+	lastIndex := rf.lastLogIndex()
+	lastTerm := rf.lastLogTerm()
 	return lastTerm > otherLastTerm ||
 		(lastTerm == otherLastTerm && lastIndex > otherLastIndex)
 }
 
-func (ps *PersistentState) match(otherTerm int, otherIndex int) bool {
-	if otherIndex >= len(ps.Logs) {
+func (rf *Raft) match(otherTerm int, otherIndex int) bool {
+	if otherIndex >= len(rf.ps.Logs) {
 		return false
 	}
-	return ps.Logs[otherIndex].Term == otherTerm
+	return rf.ps.Logs[otherIndex].Term == otherTerm
 }
 
-func (ps *PersistentState) appendLogs(entries []LogEntry) {
-	if len(entries) == 0 {
-		return
+func (rf *Raft) conflictInfo(otherTerm int, otherIndex int) (int, int) {
+	if otherIndex >= len(rf.ps.Logs) {
+		return rf.lastLogTerm(), rf.lastLogIndex()
 	}
-	mMatch := -1
-	eMatch := 0
-	for i := 0; i < len(entries); i++ {
-		idx := entries[i].Index
-		if idx < len(ps.Logs) && ps.Logs[idx].Term != entries[i].Term {
-			mMatch = idx
-			eMatch = i
+
+	term := rf.ps.Logs[otherIndex].Term
+	idx := otherIndex - 1
+	for ; idx > -1; idx-- {
+		if rf.ps.Logs[idx].Term < term {
 			break
 		}
 	}
-	if mMatch > -1 {
-		ps.Logs = append(ps.Logs[:mMatch], entries[eMatch:]...)
+	return term, idx + 1
+}
+
+func (rf *Raft) appendLogs(prevLogIndex int, entries []LogEntry) {
+	if len(entries) == 0 {
+		rf.ps.Logs = rf.ps.Logs[:prevLogIndex+1]
+		if prevLogIndex < rf.lastLogIndex() {
+			DPrintf("server %v append log, last log:{%v, %v}", rf.me, rf.lastLogTerm(), rf.lastLogIndex())
+		}
+	} else {
+		rf.ps.Logs = append(rf.ps.Logs[:entries[0].Index], entries...)
+		DPrintf("server %v append log, last log:{%v, %v}", rf.me, rf.lastLogTerm(), rf.lastLogIndex())
 	}
+	rf.persist()
+
 }
 
 type VolatileState struct {
@@ -195,6 +219,12 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.ps)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -217,6 +247,15 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var ps PersistentState
+	if d.Decode(&ps) != nil {
+		DPrintf("error when decode state")
+	} else {
+		rf.ps = ps
+	}
+
 }
 
 //
@@ -244,7 +283,9 @@ var IDGenerator int64 = 0
 func (rf *Raft) waitForRes(msg Message) Message {
 	ch := make(chan Message)
 	id := int64(rf.me*1000000000) + atomic.AddInt64(&IDGenerator, 1)
+	rf.mu.Lock()
 	rf.resMap[id] = ch
+	rf.mu.Unlock()
 	msg.Id = id
 	rf.msgCh <- msg
 
@@ -339,6 +380,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -354,6 +398,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	})
 	reply.Term = msg.Term
 	reply.Success = msg.Agreed
+	reply.LastLogIndex = msg.PrevLogIdx
+	reply.LastLogTerm = msg.PrevLogTerm
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -440,7 +486,7 @@ func (rf *Raft) tick() {
 		rf.becomeCandidate()
 	}
 
-	if rf.elapsed > rf.republicTimeout && rf.state == Leader {
+	if rf.elapsed > rf.heartbeatTimeout && rf.state == Leader {
 		rf.distribute()
 		rf.elapsed = 0
 	}
@@ -465,12 +511,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	logs := make([]LogEntry, 1)
-	logs = append(logs, LogEntry{
+	logs := []LogEntry{{
 		Command: nil,
 		Term:    0,
 		Index:   0,
-	})
+	}}
 	rf.ps = PersistentState{
 		CurrentTerm: 0,
 		VoteFor:     None,
@@ -490,7 +535,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.tickCh = make(chan interface{}, 128)
 	rf.electionTimeout = 30 + rand.Int63n(30)
-	rf.republicTimeout = rf.electionTimeout / 3
+	rf.heartbeatTimeout = rf.electionTimeout / 3
 	rf.elapsed = 0
 
 	// initialize from state persisted before a crash
@@ -519,17 +564,21 @@ func (rf *Raft) stepMessage(msg Message) {
 		rf.becomeFollower(msg.Term)
 	}
 
+	var ch chan Message
+	if msg.Id != 0 {
+		rf.mu.Lock()
+		ch = rf.resMap[msg.Id]
+		delete(rf.resMap, msg.Id)
+		rf.mu.Unlock()
+	}
+
 	if msg.To == rf.me {
 		switch msg.MType {
 		case MsgVoteRequest:
-			ch := rf.resMap[msg.Id]
-			delete(rf.resMap, msg.Id)
 			rf.stepVoteReq(msg, ch)
 		case MsgVoteResponse:
 			rf.stepVoteRes(msg)
 		case MsgAppendRequest:
-			ch := rf.resMap[msg.Id]
-			delete(rf.resMap, msg.Id)
 			rf.stepAppendReq(msg, ch)
 		case MsgAppendResponse:
 			rf.stepAppendRes(msg)
@@ -545,8 +594,6 @@ func (rf *Raft) stepMessage(msg Message) {
 	if msg.From == -1 {
 		switch msg.MType {
 		case MsgAppendCommand:
-			ch := rf.resMap[msg.Id]
-			delete(rf.resMap, msg.Id)
 			rf.stepAddCommand(msg, ch)
 		default:
 
@@ -561,14 +608,12 @@ func (rf *Raft) stepVoteReq(msg Message, ch chan<- Message) {
 			Agreed: false,
 		}
 	} else {
-		if rf.ps.VoteFor == None && !rf.ps.isUpToDate(msg.PrevLogTerm, msg.PrevLogIdx) {
-			rf.ps.VoteFor = msg.From
-			rf.elapsed = 0
+		if rf.ps.VoteFor == None && !rf.isUpToDate(msg.PrevLogTerm, msg.PrevLogIdx) {
+			rf.grantedVote(msg.From)
 			ch <- Message{
 				Term:   rf.ps.CurrentTerm,
 				Agreed: true,
 			}
-			DPrintf("follower %v vote for candidate %v in term: %v", rf.me, msg.From, rf.ps.CurrentTerm)
 		} else {
 			ch <- Message{
 				Term:   rf.ps.CurrentTerm,
@@ -585,7 +630,7 @@ func (rf *Raft) stepVoteRes(msg Message) {
 	}
 
 	if rf.vs.quorum >= len(rf.peers)/2+1 && rf.state == Candidate {
-		DPrintf("candidate %v receive %v votes, become leader in term %v", rf.me, rf.vs.quorum, rf.ps.CurrentTerm)
+		DPrintf("candidate %v become leader in term %v", rf.me, rf.ps.CurrentTerm)
 		rf.becomeLeader()
 	}
 }
@@ -599,16 +644,25 @@ func (rf *Raft) stepAppendReq(msg Message, ch chan<- Message) {
 	} else {
 		rf.becomeFollower(msg.Term)
 
-		if rf.ps.match(msg.PrevLogTerm, msg.PrevLogIdx) {
-			rf.ps.appendLogs(msg.Entries)
+		if rf.match(msg.PrevLogTerm, msg.PrevLogIdx) {
+			rf.appendLogs(msg.PrevLogIdx, msg.Entries)
 			if msg.LeaderCommit > rf.vs.commitIdx {
-				rf.vs.commitIdx = Min(msg.LeaderCommit, rf.ps.lastLogIndex())
+				rf.vs.commitIdx = Min(msg.LeaderCommit, rf.lastLogIndex())
 				rf.applyMsg()
 			}
-		} else {
 			ch <- Message{
-				Term:   rf.ps.CurrentTerm,
-				Agreed: true,
+				Term:        rf.ps.CurrentTerm,
+				PrevLogIdx:  rf.lastLogIndex(),
+				PrevLogTerm: rf.lastLogTerm(),
+				Agreed:      true,
+			}
+		} else {
+			cTerm, cIdx := rf.conflictInfo(msg.PrevLogTerm, msg.PrevLogIdx)
+			ch <- Message{
+				Term:        rf.ps.CurrentTerm,
+				Agreed:      true,
+				PrevLogIdx:  cIdx,
+				PrevLogTerm: cTerm,
 			}
 		}
 	}
@@ -617,9 +671,22 @@ func (rf *Raft) stepAppendReq(msg Message, ch chan<- Message) {
 func (rf *Raft) stepAppendRes(msg Message) {
 	if msg.Term == rf.ps.CurrentTerm && rf.state == Leader {
 		if msg.Agreed {
-
+			rf.vs.matchIdx[msg.From] = msg.PrevLogIdx
+			rf.vs.nextIdx[msg.From] = msg.PrevLogIdx + 1
+			if msg.PrevLogIdx+1 > len(rf.ps.Logs) {
+				DPrintf("error, follower %v agree and return log idx is %v but local %v",
+					msg.From, msg.PrevLogIdx+1, rf.lastLogIndex())
+			}
+			if msg.PrevLogIdx > rf.vs.commitIdx {
+				rf.commit()
+				rf.applyMsg()
+			}
 		} else {
-			rf.vs.nextIdx[msg.From]--
+			rf.vs.nextIdx[msg.From] = msg.PrevLogIdx
+			if msg.PrevLogIdx > len(rf.ps.Logs) {
+				DPrintf("error, follower %v reject and return log idx is %v but local %v",
+					msg.From, msg.PrevLogIdx, rf.lastLogIndex())
+			}
 			rf.distributeLog(msg.From, false)
 		}
 	}
@@ -632,20 +699,25 @@ func (rf *Raft) stepAddCommand(msg Message, ch chan<- Message) {
 			PrevLogTerm: -1,
 		}
 	} else {
-		lastIdx, lastTerm := rf.ps.appendCommand(msg.Command)
+		lastIdx, lastTerm := rf.appendCommand(msg.Command)
 		ch <- Message{
 			PrevLogIdx:  lastIdx,
 			PrevLogTerm: lastTerm,
 		}
+		rf.vs.matchIdx[rf.me] = lastIdx
 		// trigger distribute log entry
-		rf.elapsed = rf.republicTimeout
+		rf.elapsed = rf.heartbeatTimeout
 	}
 }
 
 func (rf *Raft) becomeFollower(term int) {
 	rf.elapsed = 0
 
+	oldTerm := rf.ps.CurrentTerm
 	rf.ps.CurrentTerm = term
+	if term > oldTerm {
+		rf.persist()
+	}
 	rf.ps.VoteFor = None
 	rf.state = Follower
 }
@@ -653,10 +725,12 @@ func (rf *Raft) becomeFollower(term int) {
 func (rf *Raft) becomeCandidate() {
 	rf.elapsed = 0
 	rf.electionTimeout = 30 + rand.Int63n(30)
-	rf.republicTimeout = rf.electionTimeout / 3
+	rf.heartbeatTimeout = rf.electionTimeout / 3
 
 	rf.ps.CurrentTerm += 1
 	rf.ps.VoteFor = rf.me
+	rf.persist()
+
 	rf.vs.quorum = 1
 
 	rf.state = Candidate
@@ -667,21 +741,26 @@ func (rf *Raft) becomeCandidate() {
 				From:        rf.me,
 				To:          i,
 				Term:        rf.ps.CurrentTerm,
-				PrevLogIdx:  rf.ps.lastLogIndex(),
-				PrevLogTerm: rf.ps.lastLogTerm(),
+				PrevLogIdx:  rf.lastLogIndex(),
+				PrevLogTerm: rf.lastLogTerm(),
 			})
 		}
 	}
-	DPrintf("server %v become candidate, term: %v", rf.me, rf.ps.CurrentTerm)
 }
 
 func (rf *Raft) becomeLeader() {
 	rf.state = Leader
 	for i := 0; i < len(rf.peers); i++ {
-		rf.vs.nextIdx[i] = rf.ps.lastLogIndex() + 1
+		rf.vs.nextIdx[i] = rf.lastLogIndex() + 1
 		rf.vs.matchIdx[i] = 0
 	}
-	rf.elapsed = rf.republicTimeout
+	rf.elapsed = rf.heartbeatTimeout
+}
+
+func (rf *Raft) grantedVote(server int) {
+	rf.ps.VoteFor = server
+	rf.elapsed = 0
+	rf.persist()
 }
 
 func (rf *Raft) distribute() {
@@ -694,11 +773,12 @@ func (rf *Raft) distribute() {
 
 func (rf *Raft) distributeLog(server int, sync bool) {
 	var entries []LogEntry
-	if rf.ps.lastLogIndex() >= rf.vs.nextIdx[server] {
+	if rf.lastLogIndex() >= rf.vs.nextIdx[server] {
 		entries = rf.ps.Logs[rf.vs.nextIdx[server]:]
 	} else {
 		entries = nil
 	}
+
 	prevLogIdx := rf.vs.nextIdx[server] - 1
 	prevLogTerm := rf.ps.Logs[prevLogIdx].Term
 	msg := Message{
@@ -764,11 +844,13 @@ func (rf *Raft) sendMsg(msg Message) {
 						})
 					} else {
 						rf.msgCh <- Message{
-							MType:  MsgAppendResponse,
-							From:   msg.To,
-							To:     rf.me,
-							Term:   reply.Term,
-							Agreed: reply.Success,
+							MType:       MsgAppendResponse,
+							From:        msg.To,
+							To:          rf.me,
+							Term:        reply.Term,
+							Agreed:      reply.Success,
+							PrevLogTerm: reply.LastLogTerm,
+							PrevLogIdx:  reply.LastLogIndex,
 						}
 					}
 				}()
