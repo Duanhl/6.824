@@ -775,7 +775,12 @@ func (rf *Raft) becomeLeader() {
 	rf.state = Leader
 	for i := 0; i < len(rf.peers); i++ {
 		rf.vs.nextIdx[i] = rf.lastLogIndex() + 1
-		rf.vs.matchIdx[i] = 0
+		if i == rf.me {
+			rf.vs.matchIdx[i] = rf.lastLogIndex()
+		} else {
+			rf.vs.matchIdx[i] = 0
+		}
+
 	}
 	rf.elapsed = rf.heartbeatTimeout
 }
