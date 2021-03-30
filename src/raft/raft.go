@@ -80,6 +80,7 @@ type Raft struct {
 	// state a Raft server must maintain.
 	ps    PersistentState
 	vs    VolatileState
+	sn    Snapshot
 	state ServerState
 
 	applyCh chan ApplyMsg
@@ -118,6 +119,12 @@ type PersistentState struct {
 	CurrentTerm int
 	VoteFor     int
 	Logs        []LogEntry
+}
+
+type Snapshot struct {
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
 }
 
 func (rf *Raft) lastLogIndex() int {
@@ -291,7 +298,12 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
-
+	rf.applyCh <- ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      snapshot,
+		SnapshotTerm:  lastIncludedTerm,
+		SnapshotIndex: lastIncludedIndex,
+	}
 	return true
 }
 
@@ -430,6 +442,36 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	res := rf.waitForRes(Message{
+		MType:       MsgInstallSnapshotRequest,
+		From:        args.LeaderId,
+		To:          rf.me,
+		Term:        args.Term,
+		PrevLogIdx:  args.LastIncludedIndex,
+		PrevLogTerm: args.LastIncludedTerm,
+		Data:        args.Data,
+	})
+	reply.Term = res.Term
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
 }
 

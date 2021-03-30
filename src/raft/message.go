@@ -8,6 +8,9 @@ const (
 	MsgAppendRequest  MessageType = 3
 	MsgAppendResponse MessageType = 4
 
+	MsgInstallSnapshotRequest  MessageType = 6
+	MsgInstallSnapshotResponse MessageType = 7
+
 	MsgAppendCommand MessageType = 5
 )
 
@@ -22,6 +25,7 @@ type Message struct {
 	Entries      []LogEntry
 	LeaderCommit int
 	Command      interface{}
+	Data         []byte
 
 	Agreed bool
 }
