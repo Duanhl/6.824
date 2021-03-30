@@ -155,33 +155,59 @@ func (rf *Raft) match(otherTerm int, otherIndex int) bool {
 	return rf.ps.Logs[otherIndex].Term == otherTerm
 }
 
-func (rf *Raft) conflictInfo(otherTerm int, otherIndex int) (int, int) {
-	if otherIndex >= len(rf.ps.Logs) {
-		return rf.lastLogTerm(), rf.lastLogIndex()
-	}
-
-	term := rf.ps.Logs[otherIndex].Term
-	idx := otherIndex - 1
-	for ; idx > -1; idx-- {
-		if rf.ps.Logs[idx].Term < term {
+func (rf *Raft) firstIndexOfTheTerm(term int) int {
+	idx := 0
+	for ; idx < len(rf.ps.Logs); idx++ {
+		if rf.ps.Logs[idx].Term == term {
 			break
 		}
 	}
-	return term, idx + 1
+	if idx == len(rf.ps.Logs) {
+		return -1
+	}
+	return idx
 }
 
-func (rf *Raft) appendLogs(prevLogIndex int, entries []LogEntry) {
-	if len(entries) == 0 {
-		rf.ps.Logs = rf.ps.Logs[:prevLogIndex+1]
-		if prevLogIndex < rf.lastLogIndex() {
-			DPrintf("server %v append log, last log:{%v, %v}", rf.me, rf.lastLogTerm(), rf.lastLogIndex())
+func (rf *Raft) lastIndexOfTheTerm(term int) int {
+	idx := rf.lastLogIndex()
+	for ; idx > -1; idx-- {
+		if rf.ps.Logs[idx].Term == term {
+			break
 		}
-	} else {
-		rf.ps.Logs = append(rf.ps.Logs[:entries[0].Index], entries...)
-		DPrintf("server %v append log, last log:{%v, %v}", rf.me, rf.lastLogTerm(), rf.lastLogIndex())
 	}
-	rf.persist()
+	return idx
+}
 
+func (rf *Raft) conflictInfo(otherTerm int, otherIndex int) (int, int) {
+	if otherIndex >= len(rf.ps.Logs) {
+		return 0, len(rf.ps.Logs)
+	}
+
+	term := rf.ps.Logs[otherIndex].Term
+	return term, rf.firstIndexOfTheTerm(term)
+}
+
+func (rf *Raft) appendLogs(matchIdx int, entries []LogEntry) (int, int) {
+	if len(entries) > 0 {
+		othIdx := 0
+		for ; othIdx < len(entries); othIdx++ {
+			idx := entries[othIdx].Index
+			if idx > rf.lastLogIndex() {
+				break
+			}
+			if rf.ps.Logs[idx].Term != entries[othIdx].Term {
+				break
+			}
+		}
+		if othIdx < len(entries) {
+			rf.ps.Logs = append(rf.ps.Logs[:entries[othIdx].Index], entries[othIdx:]...)
+			DPrintf("follower %v append log, last log is {%v, %v}", rf.me, rf.lastLogTerm(), rf.lastLogIndex())
+			rf.persist()
+		}
+		return entries[len(entries)-1].Term, entries[len(entries)-1].Index
+	} else {
+		return rf.ps.Logs[matchIdx].Term, matchIdx
+	}
 }
 
 type VolatileState struct {
@@ -645,22 +671,22 @@ func (rf *Raft) stepAppendReq(msg Message, ch chan<- Message) {
 		rf.becomeFollower(msg.Term)
 
 		if rf.match(msg.PrevLogTerm, msg.PrevLogIdx) {
-			rf.appendLogs(msg.PrevLogIdx, msg.Entries)
+			lTerm, lIndex := rf.appendLogs(msg.PrevLogIdx, msg.Entries)
 			if msg.LeaderCommit > rf.vs.commitIdx {
 				rf.vs.commitIdx = Min(msg.LeaderCommit, rf.lastLogIndex())
 				rf.applyMsg()
 			}
 			ch <- Message{
 				Term:        rf.ps.CurrentTerm,
-				PrevLogIdx:  rf.lastLogIndex(),
-				PrevLogTerm: rf.lastLogTerm(),
+				PrevLogIdx:  lIndex,
+				PrevLogTerm: lTerm,
 				Agreed:      true,
 			}
 		} else {
 			cTerm, cIdx := rf.conflictInfo(msg.PrevLogTerm, msg.PrevLogIdx)
 			ch <- Message{
 				Term:        rf.ps.CurrentTerm,
-				Agreed:      true,
+				Agreed:      false,
 				PrevLogIdx:  cIdx,
 				PrevLogTerm: cTerm,
 			}
@@ -671,21 +697,18 @@ func (rf *Raft) stepAppendReq(msg Message, ch chan<- Message) {
 func (rf *Raft) stepAppendRes(msg Message) {
 	if msg.Term == rf.ps.CurrentTerm && rf.state == Leader {
 		if msg.Agreed {
-			rf.vs.matchIdx[msg.From] = msg.PrevLogIdx
+			rf.vs.matchIdx[msg.From] = Max(msg.PrevLogIdx, rf.vs.matchIdx[msg.From])
 			rf.vs.nextIdx[msg.From] = msg.PrevLogIdx + 1
-			if msg.PrevLogIdx+1 > len(rf.ps.Logs) {
-				DPrintf("error, follower %v agree and return log idx is %v but local %v",
-					msg.From, msg.PrevLogIdx+1, rf.lastLogIndex())
-			}
 			if msg.PrevLogIdx > rf.vs.commitIdx {
 				rf.commit()
 				rf.applyMsg()
 			}
 		} else {
-			rf.vs.nextIdx[msg.From] = msg.PrevLogIdx
-			if msg.PrevLogIdx > len(rf.ps.Logs) {
-				DPrintf("error, follower %v reject and return log idx is %v but local %v",
-					msg.From, msg.PrevLogIdx, rf.lastLogIndex())
+			term := msg.PrevLogTerm
+			if term == 0 || rf.lastIndexOfTheTerm(term) == -1 {
+				rf.vs.nextIdx[msg.From] = msg.PrevLogIdx
+			} else {
+				rf.vs.nextIdx[msg.From] = rf.lastIndexOfTheTerm(term) + 1
 			}
 			rf.distributeLog(msg.From, false)
 		}
@@ -715,10 +738,10 @@ func (rf *Raft) becomeFollower(term int) {
 
 	oldTerm := rf.ps.CurrentTerm
 	rf.ps.CurrentTerm = term
+	rf.ps.VoteFor = None
 	if term > oldTerm {
 		rf.persist()
 	}
-	rf.ps.VoteFor = None
 	rf.state = Follower
 }
 
@@ -773,13 +796,15 @@ func (rf *Raft) distribute() {
 
 func (rf *Raft) distributeLog(server int, sync bool) {
 	var entries []LogEntry
+	var prevLogIdx int
 	if rf.lastLogIndex() >= rf.vs.nextIdx[server] {
 		entries = rf.ps.Logs[rf.vs.nextIdx[server]:]
+		prevLogIdx = rf.vs.nextIdx[server] - 1
 	} else {
 		entries = nil
+		prevLogIdx = rf.lastLogIndex()
 	}
 
-	prevLogIdx := rf.vs.nextIdx[server] - 1
 	prevLogTerm := rf.ps.Logs[prevLogIdx].Term
 	msg := Message{
 		MType:        MsgAppendRequest,
