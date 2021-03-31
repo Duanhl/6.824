@@ -80,7 +80,7 @@ type Raft struct {
 	// state a Raft server must maintain.
 	ps    PersistentState
 	vs    VolatileState
-	sn    Snapshot
+	sn    []byte
 	state ServerState
 
 	applyCh chan ApplyMsg
@@ -94,17 +94,25 @@ type Raft struct {
 }
 
 func (rf *Raft) applyMsg() {
-	if rf.vs.commitIdx > rf.vs.lastApplied {
-		for i := rf.vs.lastApplied + 1; i <= rf.vs.commitIdx; i++ {
-			rf.applyCh <- ApplyMsg{
-				CommandValid: true,
-				Command:      rf.ps.Logs[i].Command,
-				CommandIndex: rf.ps.Logs[i].Index,
+	if rf.vs.commitIdx > rf.ps.LastApplied {
+		first := rf.firstLogIndex()
+		if first == -1 {
+			DPrintf("error, No log entry need apply")
+		}
+		for i := 0; i < len(rf.ps.Logs); i++ {
+			idx := rf.ps.Logs[i].Index
+			if idx > rf.ps.LastApplied && idx <= rf.vs.commitIdx {
+				rf.applyCh <- ApplyMsg{
+					CommandValid: true,
+					Command:      rf.ps.Logs[i].Command,
+					CommandIndex: rf.ps.Logs[i].Index,
+				}
 			}
-			rf.vs.lastApplied++
+			rf.ps.LastApplied = rf.ps.Logs[i].Index
+			rf.persist()
 		}
 		DPrintf("server %v apply msg, lastLog:{%v, %v}", rf.me,
-			rf.ps.Logs[rf.vs.lastApplied].Term, rf.ps.Logs[rf.vs.lastApplied].Index)
+			rf.lastLogTerm(), rf.lastLogIndex())
 	}
 }
 
@@ -116,30 +124,57 @@ func (rf *Raft) commit() {
 }
 
 type PersistentState struct {
-	CurrentTerm int
-	VoteFor     int
-	Logs        []LogEntry
-}
-
-type Snapshot struct {
+	CurrentTerm       int
+	VoteFor           int
+	Logs              []LogEntry
 	LastIncludedIndex int
 	LastIncludedTerm  int
-	Data              []byte
+	LastApplied       int
 }
 
 func (rf *Raft) lastLogIndex() int {
-	return len(rf.ps.Logs) - 1
+	ll := len(rf.ps.Logs)
+	if ll == 0 {
+		return -1
+	}
+	return rf.ps.Logs[ll-1].Index
 }
 
 func (rf *Raft) lastLogTerm() int {
-	return rf.ps.Logs[len(rf.ps.Logs)-1].Term
+	ll := len(rf.ps.Logs)
+	if ll == 0 {
+		return -1
+	}
+	return rf.ps.Logs[ll-1].Term
+}
+
+func (rf *Raft) firstLogIndex() int {
+	ll := len(rf.ps.Logs)
+	if ll == 0 {
+		return -1
+	}
+	return rf.ps.Logs[0].Index
+}
+
+func (rf *Raft) firstLogTerm() int {
+	ll := len(rf.ps.Logs)
+	if ll == 0 {
+		return -1
+	}
+	return rf.ps.Logs[0].Term
 }
 
 func (rf *Raft) appendCommand(command interface{}) (int, int) {
+	var index int
+	if rf.lastLogIndex() == -1 {
+		index = rf.ps.LastIncludedIndex + 1
+	} else {
+		index = rf.lastLogIndex() + 1
+	}
 	entry := LogEntry{
 		Command: command,
 		Term:    rf.ps.CurrentTerm,
-		Index:   len(rf.ps.Logs),
+		Index:   index,
 	}
 	rf.ps.Logs = append(rf.ps.Logs, entry)
 	rf.persist()
@@ -151,28 +186,37 @@ func (rf *Raft) appendCommand(command interface{}) (int, int) {
 func (rf *Raft) isUpToDate(otherLastTerm int, otherLastIndex int) bool {
 	lastIndex := rf.lastLogIndex()
 	lastTerm := rf.lastLogTerm()
-	return lastTerm > otherLastTerm ||
-		(lastTerm == otherLastTerm && lastIndex > otherLastIndex)
+	if lastIndex == -1 {
+		return rf.ps.LastIncludedTerm > otherLastTerm ||
+			(rf.ps.LastIncludedTerm == otherLastTerm && rf.ps.LastIncludedIndex > otherLastIndex)
+	} else {
+		return lastTerm > otherLastTerm ||
+			(lastTerm == otherLastTerm && lastIndex > otherLastIndex)
+	}
 }
 
 func (rf *Raft) match(otherTerm int, otherIndex int) bool {
-	if otherIndex >= len(rf.ps.Logs) {
+	if rf.firstLogIndex() == -1 {
+		return otherIndex == rf.ps.LastIncludedIndex && otherTerm == rf.ps.LastIncludedTerm
+	}
+	if otherIndex < rf.ps.LastIncludedIndex || otherIndex > rf.lastLogIndex() {
 		return false
 	}
-	return rf.ps.Logs[otherIndex].Term == otherTerm
+	return (otherIndex == rf.ps.LastIncludedIndex && otherTerm == rf.ps.LastIncludedTerm) ||
+		(rf.ps.Logs[otherIndex-rf.firstLogIndex()].Term == otherTerm)
 }
 
 func (rf *Raft) firstIndexOfTheTerm(term int) int {
 	idx := 0
-	for ; idx < len(rf.ps.Logs); idx++ {
+	for ; idx < rf.lastLogIndex()+1; idx++ {
 		if rf.ps.Logs[idx].Term == term {
 			break
 		}
 	}
-	if idx == len(rf.ps.Logs) {
+	if idx == rf.lastLogIndex()+1 {
 		return -1
 	}
-	return idx
+	return rf.ps.Logs[idx].Index
 }
 
 func (rf *Raft) lastIndexOfTheTerm(term int) int {
@@ -182,12 +226,12 @@ func (rf *Raft) lastIndexOfTheTerm(term int) int {
 			break
 		}
 	}
-	return idx
+	return rf.ps.Logs[idx].Index
 }
 
 func (rf *Raft) conflictInfo(otherTerm int, otherIndex int) (int, int) {
-	if otherIndex >= len(rf.ps.Logs) {
-		return 0, len(rf.ps.Logs)
+	if otherIndex > rf.lastLogIndex() {
+		return 0, rf.lastLogIndex() + 1
 	}
 
 	term := rf.ps.Logs[otherIndex].Term
@@ -196,33 +240,41 @@ func (rf *Raft) conflictInfo(otherTerm int, otherIndex int) (int, int) {
 
 func (rf *Raft) appendLogs(matchIdx int, entries []LogEntry) (int, int) {
 	if len(entries) > 0 {
-		othIdx := 0
-		for ; othIdx < len(entries); othIdx++ {
-			idx := entries[othIdx].Index
-			if idx > rf.lastLogIndex() {
-				break
+		if rf.firstLogIndex() == -1 {
+			rf.ps.Logs = entries
+		} else {
+			othIdx := 0
+			for ; othIdx < len(entries); othIdx++ {
+				idx := entries[othIdx].Index
+				if idx > rf.lastLogIndex() {
+					break
+				}
+				if rf.ps.Logs[idx-rf.firstLogIndex()].Term != entries[othIdx].Term {
+					break
+				}
 			}
-			if rf.ps.Logs[idx].Term != entries[othIdx].Term {
-				break
+			if othIdx < len(entries) {
+				rf.ps.Logs = append(rf.ps.Logs[:entries[othIdx].Index-rf.firstLogIndex()], entries[othIdx:]...)
+				DPrintf("follower %v append log, last log is {%v, %v}", rf.me, rf.lastLogTerm(), rf.lastLogIndex())
+				rf.persist()
 			}
-		}
-		if othIdx < len(entries) {
-			rf.ps.Logs = append(rf.ps.Logs[:entries[othIdx].Index], entries[othIdx:]...)
-			DPrintf("follower %v append log, last log is {%v, %v}", rf.me, rf.lastLogTerm(), rf.lastLogIndex())
-			rf.persist()
 		}
 		return entries[len(entries)-1].Term, entries[len(entries)-1].Index
+
 	} else {
-		return rf.ps.Logs[matchIdx].Term, matchIdx
+		if rf.firstLogIndex() == -1 {
+			return rf.ps.LastIncludedTerm, rf.ps.LastIncludedIndex
+		} else {
+			return rf.ps.Logs[matchIdx].Term, matchIdx
+		}
 	}
 }
 
 type VolatileState struct {
-	commitIdx   int
-	lastApplied int
-	nextIdx     []int
-	matchIdx    []int
-	quorum      int
+	commitIdx int
+	nextIdx   []int
+	matchIdx  []int
+	quorum    int
 }
 
 // return currentTerm and whether this server
@@ -298,11 +350,18 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
-	rf.applyCh <- ApplyMsg{
-		SnapshotValid: true,
-		Snapshot:      snapshot,
-		SnapshotTerm:  lastIncludedTerm,
-		SnapshotIndex: lastIncludedIndex,
+	if rf.ps.LastIncludedIndex < lastIncludedIndex {
+		rf.ps.LastIncludedIndex = lastIncludedIndex
+		rf.ps.LastIncludedTerm = lastIncludedTerm
+		rf.sn = snapshot
+		firstIndex := rf.firstLogIndex()
+		if firstIndex != -1 && rf.ps.LastIncludedIndex > firstIndex &&
+			rf.ps.LastIncludedIndex < rf.lastLogIndex() {
+			rf.ps.Logs = rf.ps.Logs[rf.ps.LastIncludedIndex-firstIndex+1:]
+		} else {
+			rf.ps.Logs = []LogEntry{}
+		}
+		rf.persist()
 	}
 	return true
 }
@@ -313,7 +372,14 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-
+	rf.sn = clone(snapshot)
+	msg := rf.waitForRes(Message{
+		MType:      MsgSnapshot,
+		From:       -1,
+		PrevLogIdx: index,
+		Data:       snapshot,
+	})
+	msg.Agreed = true
 }
 
 var IDGenerator int64 = 0
@@ -585,15 +651,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		Index:   0,
 	}}
 	rf.ps = PersistentState{
-		CurrentTerm: 0,
-		VoteFor:     None,
-		Logs:        logs,
+		CurrentTerm:       0,
+		VoteFor:           None,
+		Logs:              logs,
+		LastIncludedIndex: 0,
+		LastIncludedTerm:  0,
+		LastApplied:       0,
 	}
 	rf.vs = VolatileState{
-		commitIdx:   0,
-		lastApplied: 0,
-		nextIdx:     make([]int, len(rf.peers)),
-		matchIdx:    make([]int, len(rf.peers)),
+		commitIdx: 0,
+		nextIdx:   make([]int, len(rf.peers)),
+		matchIdx:  make([]int, len(rf.peers)),
 	}
 	rf.state = Follower
 
@@ -650,6 +718,9 @@ func (rf *Raft) stepMessage(msg Message) {
 			rf.stepAppendReq(msg, ch)
 		case MsgAppendResponse:
 			rf.stepAppendRes(msg)
+		case MsgInstallSnapshotRequest:
+			rf.stepInstallSnapshotRequest(msg, ch)
+		case MsgInstallSnapshotResponse:
 		default:
 		}
 	}
@@ -663,8 +734,9 @@ func (rf *Raft) stepMessage(msg Message) {
 		switch msg.MType {
 		case MsgAppendCommand:
 			rf.stepAddCommand(msg, ch)
+		case MsgSnapshot:
+			rf.stepSnapshot(msg.PrevLogIdx, msg.Data)
 		default:
-
 		}
 	}
 }
@@ -773,6 +845,51 @@ func (rf *Raft) stepAddCommand(msg Message, ch chan<- Message) {
 		// trigger distribute log entry
 		rf.elapsed = rf.heartbeatTimeout
 	}
+}
+
+func (rf *Raft) stepInstallSnapshotRequest(msg Message, ch chan<- Message) {
+	if rf.state != Follower {
+		ch <- Message{
+			Agreed: false,
+		}
+	} else {
+		if msg.Term < rf.ps.CurrentTerm {
+			ch <- Message{
+				Agreed: false,
+			}
+		} else {
+			if msg.PrevLogIdx <= rf.ps.LastIncludedIndex {
+				ch <- Message{
+					Agreed: false,
+				}
+			} else {
+				rf.applyCh <- ApplyMsg{
+					SnapshotValid: true,
+					Snapshot:      msg.Data,
+					SnapshotTerm:  msg.PrevLogTerm,
+					SnapshotIndex: msg.PrevLogIdx,
+				}
+				ch <- Message{
+					Agreed: true,
+				}
+			}
+		}
+	}
+}
+
+func (rf *Raft) stepSnapshot(index int, snapshot []byte) {
+	first := rf.firstLogIndex()
+	if first == -1 {
+		panic("invalid log state")
+	}
+	rf.ps.LastIncludedIndex = index
+	rf.ps.LastIncludedTerm = rf.ps.Logs[index-first].Term
+	if index-first+1 == rf.lastLogIndex() {
+		rf.ps.Logs = nil
+	} else {
+		rf.ps.Logs = rf.ps.Logs[index-first+1:]
+	}
+	rf.persist()
 }
 
 func (rf *Raft) becomeFollower(term int) {

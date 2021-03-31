@@ -10,6 +10,7 @@ const (
 
 	MsgInstallSnapshotRequest  MessageType = 6
 	MsgInstallSnapshotResponse MessageType = 7
+	MsgSnapshot                MessageType = 8
 
 	MsgAppendCommand MessageType = 5
 )
