@@ -135,7 +135,7 @@ type PersistentState struct {
 func (rf *Raft) lastLogIndex() int {
 	ll := len(rf.ps.Logs)
 	if ll == 0 {
-		return -1
+		return rf.ps.LastIncludedIndex
 	}
 	return rf.ps.Logs[ll-1].Index
 }
@@ -143,34 +143,21 @@ func (rf *Raft) lastLogIndex() int {
 func (rf *Raft) lastLogTerm() int {
 	ll := len(rf.ps.Logs)
 	if ll == 0 {
-		return -1
+		return rf.ps.LastIncludedTerm
 	}
 	return rf.ps.Logs[ll-1].Term
 }
 
 func (rf *Raft) firstLogIndex() int {
-	ll := len(rf.ps.Logs)
-	if ll == 0 {
-		return -1
-	}
-	return rf.ps.Logs[0].Index
+	return rf.ps.LastIncludedIndex
 }
 
 func (rf *Raft) firstLogTerm() int {
-	ll := len(rf.ps.Logs)
-	if ll == 0 {
-		return -1
-	}
-	return rf.ps.Logs[0].Term
+	return rf.ps.LastIncludedTerm
 }
 
 func (rf *Raft) appendCommand(command interface{}) (int, int) {
-	var index int
-	if rf.lastLogIndex() == -1 {
-		index = rf.ps.LastIncludedIndex + 1
-	} else {
-		index = rf.lastLogIndex() + 1
-	}
+	index := rf.lastLogIndex() + 1
 	entry := LogEntry{
 		Command: command,
 		Term:    rf.ps.CurrentTerm,
@@ -186,86 +173,87 @@ func (rf *Raft) appendCommand(command interface{}) (int, int) {
 func (rf *Raft) isUpToDate(otherLastTerm int, otherLastIndex int) bool {
 	lastIndex := rf.lastLogIndex()
 	lastTerm := rf.lastLogTerm()
-	if lastIndex == -1 {
-		return rf.ps.LastIncludedTerm > otherLastTerm ||
-			(rf.ps.LastIncludedTerm == otherLastTerm && rf.ps.LastIncludedIndex > otherLastIndex)
-	} else {
-		return lastTerm > otherLastTerm ||
-			(lastTerm == otherLastTerm && lastIndex > otherLastIndex)
-	}
+	return lastTerm > otherLastTerm || (lastTerm == otherLastTerm && lastIndex > otherLastIndex)
 }
 
 func (rf *Raft) match(otherTerm int, otherIndex int) bool {
-	if rf.firstLogIndex() == -1 {
-		return otherIndex == rf.ps.LastIncludedIndex && otherTerm == rf.ps.LastIncludedTerm
-	}
-	if otherIndex < rf.ps.LastIncludedIndex || otherIndex > rf.lastLogIndex() {
+	if otherIndex > rf.lastLogIndex() || otherIndex < rf.firstLogIndex() {
 		return false
 	}
-	return (otherIndex == rf.ps.LastIncludedIndex && otherTerm == rf.ps.LastIncludedTerm) ||
-		(rf.ps.Logs[otherIndex-rf.firstLogIndex()].Term == otherTerm)
+	if otherIndex == rf.ps.LastIncludedIndex {
+		return otherTerm == rf.ps.LastIncludedTerm
+	} else {
+		return rf.ps.Logs[otherIndex-rf.ps.LastIncludedIndex-1].Term == otherTerm
+	}
 }
 
 func (rf *Raft) firstIndexOfTheTerm(term int) int {
+	if rf.ps.LastIncludedTerm == term {
+		return rf.ps.LastIncludedIndex
+	}
 	idx := 0
-	for ; idx < rf.lastLogIndex()+1; idx++ {
+	for ; idx < len(rf.ps.Logs); idx++ {
 		if rf.ps.Logs[idx].Term == term {
 			break
 		}
 	}
-	if idx == rf.lastLogIndex()+1 {
+	if idx == len(rf.ps.Logs) {
 		return -1
 	}
 	return rf.ps.Logs[idx].Index
 }
 
 func (rf *Raft) lastIndexOfTheTerm(term int) int {
-	idx := rf.lastLogIndex()
+	idx := len(rf.ps.Logs) - 1
 	for ; idx > -1; idx-- {
 		if rf.ps.Logs[idx].Term == term {
 			break
+		}
+	}
+	if idx == -1 {
+		if term == rf.ps.LastIncludedTerm {
+			return rf.ps.LastIncludedIndex
+		} else {
+			return -1
 		}
 	}
 	return rf.ps.Logs[idx].Index
 }
 
 func (rf *Raft) conflictInfo(otherTerm int, otherIndex int) (int, int) {
+	if otherIndex <= rf.firstLogIndex() {
+		return rf.firstLogTerm(), rf.firstLogIndex()
+	}
 	if otherIndex > rf.lastLogIndex() {
 		return 0, rf.lastLogIndex() + 1
 	}
-
-	term := rf.ps.Logs[otherIndex].Term
+	term := rf.ps.Logs[otherIndex-rf.firstLogIndex()-1].Term
 	return term, rf.firstIndexOfTheTerm(term)
 }
 
 func (rf *Raft) appendLogs(matchIdx int, entries []LogEntry) (int, int) {
 	if len(entries) > 0 {
-		if rf.firstLogIndex() == -1 {
-			rf.ps.Logs = entries
-		} else {
-			othIdx := 0
-			for ; othIdx < len(entries); othIdx++ {
-				idx := entries[othIdx].Index
-				if idx > rf.lastLogIndex() {
-					break
-				}
-				if rf.ps.Logs[idx-rf.firstLogIndex()].Term != entries[othIdx].Term {
-					break
-				}
+		othIdx := 0
+		for ; othIdx < len(entries); othIdx++ {
+			idx := entries[othIdx].Index
+			if idx > rf.lastLogIndex() {
+				break
 			}
-			if othIdx < len(entries) {
-				rf.ps.Logs = append(rf.ps.Logs[:entries[othIdx].Index-rf.firstLogIndex()], entries[othIdx:]...)
-				DPrintf("follower %v append log, last log is {%v, %v}", rf.me, rf.lastLogTerm(), rf.lastLogIndex())
-				rf.persist()
+			if rf.ps.Logs[idx-rf.firstLogIndex()].Term != entries[othIdx].Term {
+				break
 			}
 		}
+		if othIdx < len(entries) {
+			rf.ps.Logs = append(rf.ps.Logs[:entries[othIdx].Index-rf.firstLogIndex()-1], entries[othIdx:]...)
+			DPrintf("follower %v append log, last log is {%v, %v}", rf.me, rf.lastLogTerm(), rf.lastLogIndex())
+			rf.persist()
+		}
 		return entries[len(entries)-1].Term, entries[len(entries)-1].Index
-
 	} else {
-		if rf.firstLogIndex() == -1 {
-			return rf.ps.LastIncludedTerm, rf.ps.LastIncludedIndex
+		if matchIdx == rf.ps.LastIncludedIndex {
+			return rf.ps.LastIncludedIndex, rf.ps.LastIncludedTerm
 		} else {
-			return rf.ps.Logs[matchIdx].Term, matchIdx
+			return rf.ps.Logs[matchIdx-rf.firstLogIndex()-1].Term, matchIdx
 		}
 	}
 }
@@ -960,25 +948,43 @@ func (rf *Raft) distribute() {
 
 func (rf *Raft) distributeLog(server int, sync bool) {
 	var entries []LogEntry
-	var prevLogIdx int
-	if rf.lastLogIndex() >= rf.vs.nextIdx[server] {
-		entries = rf.ps.Logs[rf.vs.nextIdx[server]:]
-		prevLogIdx = rf.vs.nextIdx[server] - 1
+	var prevLogIdx, prevLogTerm int
+	nextIndex := rf.vs.nextIdx[server]
+	var msg Message
+	if nextIndex <= rf.firstLogIndex() {
+		msg = Message{
+			MType:       MsgInstallSnapshotRequest,
+			From:        rf.me,
+			To:          server,
+			Term:        rf.ps.CurrentTerm,
+			PrevLogIdx:  rf.ps.LastIncludedIndex,
+			PrevLogTerm: rf.ps.LastIncludedTerm,
+			Data:        clone(rf.sn),
+		}
 	} else {
-		entries = nil
-		prevLogIdx = rf.lastLogIndex()
-	}
-
-	prevLogTerm := rf.ps.Logs[prevLogIdx].Term
-	msg := Message{
-		MType:        MsgAppendRequest,
-		From:         rf.me,
-		To:           server,
-		Term:         rf.ps.CurrentTerm,
-		PrevLogIdx:   prevLogIdx,
-		PrevLogTerm:  prevLogTerm,
-		Entries:      entries,
-		LeaderCommit: rf.vs.commitIdx,
+		if rf.lastLogIndex() >= nextIndex {
+			entries = rf.ps.Logs[nextIndex-rf.firstLogIndex()-1:]
+			prevLogIdx = nextIndex - 1
+			if prevLogIdx == rf.ps.LastIncludedIndex {
+				prevLogTerm = rf.ps.LastIncludedTerm
+			} else {
+				prevLogTerm = rf.ps.Logs[prevLogIdx-rf.firstLogIndex()-1].Term
+			}
+		} else {
+			entries = nil
+			prevLogIdx = rf.lastLogIndex()
+			prevLogTerm = rf.lastLogTerm()
+		}
+		msg = Message{
+			MType:        MsgAppendRequest,
+			From:         rf.me,
+			To:           server,
+			Term:         rf.ps.CurrentTerm,
+			PrevLogIdx:   prevLogIdx,
+			PrevLogTerm:  prevLogTerm,
+			Entries:      entries,
+			LeaderCommit: rf.vs.commitIdx,
+		}
 	}
 	if sync {
 		rf.sendMsg(msg)
