@@ -4,6 +4,7 @@ import (
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -18,10 +19,22 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+type OpType int8
+
+const (
+	GET    OpType = 0
+	PUT    OpType = 1
+	APPEND OpType = 3
+)
+
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Type  OpType
+	Id    int64
+	Key   string
+	Value string
 }
 
 type KVServer struct {
@@ -34,10 +47,17 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	store             map[string]string
+	lastIncludedIndex int
+	lastIncludedTerm  int
+
+	ticker chan struct{}
+	msgCh  chan Op
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -92,8 +112,78 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.ticker = make(chan struct{})
+	kv.msgCh = make(chan Op)
 
 	// You may need initialization code here.
+	go kv.run()
 
 	return kv
+}
+
+func (kv *KVServer) run() {
+	for {
+		select {
+		case applyMsg := <-kv.applyCh:
+			kv.apply(applyMsg)
+		case op := <-kv.msgCh:
+			kv.process(op)
+		}
+	}
+}
+
+func (kv *KVServer) apply(applyMsg raft.ApplyMsg) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if applyMsg.CommandValid {
+		op := applyMsg.Command.(*Op)
+		switch op.Type {
+		case GET:
+			break
+		case PUT:
+			kv.store[op.Key] = op.Value
+		case APPEND:
+			if v, ok := kv.store[op.Key]; ok {
+				kv.store[op.Key] = v + op.Value
+			} else {
+				kv.store[op.Key] = op.Value
+			}
+		}
+		if kv.checkStateSize(applyMsg.CommandIndex) {
+
+			b := new(bytes.Buffer)
+			e := labgob.NewEncoder(b)
+
+			if err := e.Encode(kv.store); err != nil {
+				panic("encode store failed")
+			}
+
+			kv.lastIncludedIndex = applyMsg.CommandIndex
+			kv.rf.Snapshot(applyMsg.CommandIndex, b.Bytes())
+		}
+	}
+
+	if applyMsg.SnapshotValid {
+		b := bytes.NewBuffer(applyMsg.Snapshot)
+		d := labgob.NewDecoder(b)
+
+		var store map[string]string
+
+		if err := d.Decode(&store); err != nil {
+			panic("decode store failed")
+		}
+
+		kv.store = store
+		kv.lastIncludedIndex = applyMsg.SnapshotIndex
+		kv.lastIncludedTerm = applyMsg.SnapshotTerm
+	}
+}
+
+func (kv *KVServer) process(op Op) {
+
+}
+
+func (kv *KVServer) checkStateSize(applyIndex int) bool {
+	return applyIndex-kv.lastIncludedIndex >= kv.maxraftstate
 }

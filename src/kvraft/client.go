@@ -1,12 +1,19 @@
 package kvraft
 
-import "6.824/labrpc"
+import (
+	"6.824/labrpc"
+	"time"
+)
 import "crypto/rand"
 import "math/big"
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+
+	leader int
+	msgCh  chan ClientMsg
+	resMap map[int64]chan ClientMsg
 }
 
 func nrand() int64 {
@@ -38,7 +45,36 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
+	args := &GetArgs{
+		Key: key,
+		Id:  nrand(),
+	}
+	reply := &GetReply{}
+	for true {
+		if ok := ck.servers[ck.leader].Call("Get", args, reply); ok {
+			switch reply.Err {
+			case OK:
+				return reply.Value
+			case ErrNoKey:
+				return ""
+			case ErrWrongLeader:
+				ck.loopForNextLeader()
+			}
+		} else {
+			time.Sleep(time.Millisecond * 20)
+			ck.loopForNextLeader()
+		}
+	}
+
 	return ""
+}
+
+func (ck *Clerk) loopForNextLeader() {
+	if ck.leader == len(ck.servers)-1 {
+		ck.leader = 0
+	} else {
+		ck.leader++
+	}
 }
 
 //
@@ -53,6 +89,30 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+
+	args := PutAppendArgs{
+		Key:   key,
+		Value: value,
+		Op:    op,
+		Id:    nrand(),
+	}
+	reply := &PutAppendReply{}
+	for true {
+		if ok := ck.servers[ck.leader].Call("PutAppend", args, reply); ok {
+			switch reply.Err {
+			case OK:
+				return
+			case ErrNoKey:
+				DPrintf("error return type")
+				return
+			case ErrWrongLeader:
+				ck.loopForNextLeader()
+			}
+		} else {
+			time.Sleep(time.Microsecond * 20)
+			ck.loopForNextLeader()
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

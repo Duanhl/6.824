@@ -95,10 +95,6 @@ type Raft struct {
 
 func (rf *Raft) applyMsg() {
 	if rf.vs.commitIdx > rf.ps.LastApplied {
-		first := rf.firstLogIndex()
-		if first == -1 {
-			DPrintf("error, No log entry need apply")
-		}
 		for i := 0; i < len(rf.ps.Logs); i++ {
 			idx := rf.ps.Logs[i].Index
 			if idx > rf.ps.LastApplied && idx <= rf.vs.commitIdx {
@@ -111,18 +107,30 @@ func (rf *Raft) applyMsg() {
 			rf.ps.LastApplied = rf.ps.Logs[i].Index
 			rf.persist()
 		}
+
+		term, index := rf.lastLogInfo()
 		DPrintf("server %v apply msg, lastLog:{%v, %v}", rf.me,
-			rf.lastLogTerm(), rf.lastLogIndex())
+			term, index)
 	}
 }
 
 func (rf *Raft) commit() {
 	mayCommitIdx := Majority(rf.vs.matchIdx)
-	if mayCommitIdx > rf.vs.commitIdx && rf.ps.Logs[mayCommitIdx].Term == rf.ps.CurrentTerm {
+	entry := rf.entry(mayCommitIdx)
+	if mayCommitIdx > rf.vs.commitIdx && entry.Term == rf.ps.CurrentTerm {
 		rf.vs.commitIdx = mayCommitIdx
 	}
 }
 
+/**
+ * ----------------------  --------------------------------
+ * |  lastIncludedIndex |  |  Index   | Index   | Index   |
+ * |  lastIncludedTerm  |  |  Term    | Term    | Term    |
+ * |  snapshot          |  |  Command | Command | Command |
+ * |---------------------  --------------------------------
+ * 日志分为两个部分，一个部分包含已经丢弃了的日志，这些日志都是已经执行了的，只需要记录
+ * 执行后的快照和被丢弃的最后一个日志的信息，另外就是仍留存的日志
+ */
 type PersistentState struct {
 	CurrentTerm       int
 	VoteFor           int
@@ -130,6 +138,24 @@ type PersistentState struct {
 	LastIncludedIndex int
 	LastIncludedTerm  int
 	LastApplied       int
+}
+
+func (rf *Raft) lastLogInfo() (int, int) {
+	if len(rf.ps.Logs) == 0 {
+		return rf.ps.LastIncludedTerm, rf.ps.LastIncludedIndex
+	} else {
+		entry := rf.ps.Logs[len(rf.ps.Logs)-1]
+		return entry.Term, entry.Index
+	}
+}
+
+func (rf *Raft) realLogIndex(index int) int {
+	_, lIndex := rf.lastLogInfo()
+	if index > lIndex {
+		return -1
+	} else {
+		return index - rf.ps.LastIncludedIndex - 1
+	}
 }
 
 func (rf *Raft) lastLogIndex() int {
@@ -157,7 +183,8 @@ func (rf *Raft) firstLogTerm() int {
 }
 
 func (rf *Raft) appendCommand(command interface{}) (int, int) {
-	index := rf.lastLogIndex() + 1
+	_, oldIndex := rf.lastLogInfo()
+	index := oldIndex + 1
 	entry := LogEntry{
 		Command: command,
 		Term:    rf.ps.CurrentTerm,
@@ -165,25 +192,33 @@ func (rf *Raft) appendCommand(command interface{}) (int, int) {
 	}
 	rf.ps.Logs = append(rf.ps.Logs, entry)
 	rf.persist()
-	DPrintf("leader %v add command %v in log:{%v, %v}", rf.me, command,
-		rf.lastLogTerm(), rf.lastLogIndex())
 	return entry.Index, entry.Term
 }
 
 func (rf *Raft) isUpToDate(otherLastTerm int, otherLastIndex int) bool {
-	lastIndex := rf.lastLogIndex()
-	lastTerm := rf.lastLogTerm()
-	return lastTerm > otherLastTerm || (lastTerm == otherLastTerm && lastIndex > otherLastIndex)
+	lTerm, lIndex := rf.lastLogInfo()
+	return lTerm > otherLastTerm || (lTerm == otherLastTerm && lIndex > otherLastIndex)
 }
 
 func (rf *Raft) match(otherTerm int, otherIndex int) bool {
-	if otherIndex > rf.lastLogIndex() || otherIndex < rf.firstLogIndex() {
+	_, lIndex := rf.lastLogInfo()
+	if otherIndex > lIndex || otherIndex < rf.ps.LastIncludedIndex {
 		return false
 	}
-	if otherIndex == rf.ps.LastIncludedIndex {
-		return otherTerm == rf.ps.LastIncludedTerm
+	return rf.entry(otherIndex).Term == otherTerm
+}
+
+func (rf *Raft) entry(index int) *LogEntry {
+	_, lIndex := rf.lastLogInfo()
+	if index < rf.ps.LastIncludedIndex || index > lIndex {
+		return nil
+	} else if index == rf.ps.LastIncludedIndex {
+		return &LogEntry{
+			Term:  rf.ps.LastIncludedTerm,
+			Index: rf.ps.LastIncludedIndex,
+		}
 	} else {
-		return rf.ps.Logs[otherIndex-rf.ps.LastIncludedIndex-1].Term == otherTerm
+		return &rf.ps.Logs[rf.realLogIndex(index)]
 	}
 }
 
@@ -221,39 +256,40 @@ func (rf *Raft) lastIndexOfTheTerm(term int) int {
 }
 
 func (rf *Raft) conflictInfo(otherTerm int, otherIndex int) (int, int) {
-	if otherIndex <= rf.firstLogIndex() {
-		return rf.firstLogTerm(), rf.firstLogIndex()
+	lTerm, lIndex := rf.lastLogInfo()
+	if otherIndex <= rf.ps.LastIncludedIndex {
+		return rf.ps.LastIncludedTerm, rf.ps.LastIncludedIndex
+	} else if otherIndex > lIndex {
+		return lTerm, lIndex
+	} else {
+		term := rf.ps.Logs[rf.realLogIndex(otherIndex)].Term
+		return term, rf.firstIndexOfTheTerm(term)
 	}
-	if otherIndex > rf.lastLogIndex() {
-		return 0, rf.lastLogIndex() + 1
-	}
-	term := rf.ps.Logs[otherIndex-rf.firstLogIndex()-1].Term
-	return term, rf.firstIndexOfTheTerm(term)
 }
 
 func (rf *Raft) appendLogs(matchIdx int, entries []LogEntry) (int, int) {
 	if len(entries) > 0 {
 		othIdx := 0
+		_, lIndex := rf.lastLogInfo()
 		for ; othIdx < len(entries); othIdx++ {
 			idx := entries[othIdx].Index
-			if idx > rf.lastLogIndex() {
+			if idx > lIndex {
 				break
 			}
-			if rf.ps.Logs[idx-rf.firstLogIndex()].Term != entries[othIdx].Term {
+			if rf.entry(idx).Term != entries[othIdx].Term {
 				break
 			}
 		}
 		if othIdx < len(entries) {
-			rf.ps.Logs = append(rf.ps.Logs[:entries[othIdx].Index-rf.firstLogIndex()-1], entries[othIdx:]...)
-			DPrintf("follower %v append log, last log is {%v, %v}", rf.me, rf.lastLogTerm(), rf.lastLogIndex())
+			rf.ps.Logs = append(rf.ps.Logs[:rf.realLogIndex(entries[othIdx].Index)], entries[othIdx:]...)
 			rf.persist()
 		}
 		return entries[len(entries)-1].Term, entries[len(entries)-1].Index
 	} else {
 		if matchIdx == rf.ps.LastIncludedIndex {
-			return rf.ps.LastIncludedIndex, rf.ps.LastIncludedTerm
+			return rf.ps.LastIncludedTerm, rf.ps.LastIncludedIndex
 		} else {
-			return rf.ps.Logs[matchIdx-rf.firstLogIndex()-1].Term, matchIdx
+			return rf.ps.Logs[rf.realLogIndex(matchIdx)].Term, matchIdx
 		}
 	}
 }
@@ -297,13 +333,13 @@ func (rf *Raft) persist() {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.ps)
 	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	rf.persister.SaveStateAndSnapshot(data, rf.sn)
 }
 
 //
 // restore previously persisted state.
 //
-func (rf *Raft) readPersist(data []byte) {
+func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -327,6 +363,7 @@ func (rf *Raft) readPersist(data []byte) {
 		DPrintf("error when decode state")
 	} else {
 		rf.ps = ps
+		rf.sn = snapshot
 	}
 
 }
@@ -338,19 +375,13 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
-	if rf.ps.LastIncludedIndex < lastIncludedIndex {
-		rf.ps.LastIncludedIndex = lastIncludedIndex
-		rf.ps.LastIncludedTerm = lastIncludedTerm
-		rf.sn = snapshot
-		firstIndex := rf.firstLogIndex()
-		if firstIndex != -1 && rf.ps.LastIncludedIndex > firstIndex &&
-			rf.ps.LastIncludedIndex < rf.lastLogIndex() {
-			rf.ps.Logs = rf.ps.Logs[rf.ps.LastIncludedIndex-firstIndex+1:]
-		} else {
-			rf.ps.Logs = []LogEntry{}
-		}
-		rf.persist()
-	}
+	rf.waitForRes(Message{
+		MType:       MsgConInstallSnapshot,
+		From:        -1,
+		PrevLogIdx:  lastIncludedIndex,
+		PrevLogTerm: lastIncludedTerm,
+		Data:        snapshot,
+	})
 	return true
 }
 
@@ -360,14 +391,12 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-	rf.sn = clone(snapshot)
-	msg := rf.waitForRes(Message{
+	rf.msgCh <- Message{
 		MType:      MsgSnapshot,
 		From:       -1,
 		PrevLogIdx: index,
 		Data:       snapshot,
-	})
-	msg.Agreed = true
+	}
 }
 
 var IDGenerator int64 = 0
@@ -508,7 +537,8 @@ type InstallSnapshotArgs struct {
 }
 
 type InstallSnapshotReply struct {
-	Term int
+	LastIncludedIndex int
+	Term              int
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
@@ -633,11 +663,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	logs := []LogEntry{{
-		Command: nil,
-		Term:    0,
-		Index:   0,
-	}}
+	var logs []LogEntry
 	rf.ps = PersistentState{
 		CurrentTerm:       0,
 		VoteFor:           None,
@@ -663,7 +689,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.elapsed = 0
 
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	rf.readPersist(persister.ReadRaftState(), persister.ReadSnapshot())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
@@ -709,6 +735,7 @@ func (rf *Raft) stepMessage(msg Message) {
 		case MsgInstallSnapshotRequest:
 			rf.stepInstallSnapshotRequest(msg, ch)
 		case MsgInstallSnapshotResponse:
+			rf.stepInstallSnapshotResponse(msg)
 		default:
 		}
 	}
@@ -724,6 +751,8 @@ func (rf *Raft) stepMessage(msg Message) {
 			rf.stepAddCommand(msg, ch)
 		case MsgSnapshot:
 			rf.stepSnapshot(msg.PrevLogIdx, msg.Data)
+		case MsgConInstallSnapshot:
+			rf.stepCondInstallSnapshot(msg.PrevLogIdx, msg.PrevLogTerm, msg.Data, ch)
 		default:
 		}
 	}
@@ -775,7 +804,8 @@ func (rf *Raft) stepAppendReq(msg Message, ch chan<- Message) {
 		if rf.match(msg.PrevLogTerm, msg.PrevLogIdx) {
 			lTerm, lIndex := rf.appendLogs(msg.PrevLogIdx, msg.Entries)
 			if msg.LeaderCommit > rf.vs.commitIdx {
-				rf.vs.commitIdx = Min(msg.LeaderCommit, rf.lastLogIndex())
+				_, lIndex = rf.lastLogInfo()
+				rf.vs.commitIdx = Min(msg.LeaderCommit, lIndex)
 				rf.applyMsg()
 			}
 			ch <- Message{
@@ -836,48 +866,85 @@ func (rf *Raft) stepAddCommand(msg Message, ch chan<- Message) {
 }
 
 func (rf *Raft) stepInstallSnapshotRequest(msg Message, ch chan<- Message) {
-	if rf.state != Follower {
+	if rf.state != Follower || msg.Term < rf.ps.CurrentTerm || msg.PrevLogIdx <= rf.ps.LastIncludedIndex {
 		ch <- Message{
 			Agreed: false,
 		}
 	} else {
-		if msg.Term < rf.ps.CurrentTerm {
-			ch <- Message{
-				Agreed: false,
-			}
-		} else {
-			if msg.PrevLogIdx <= rf.ps.LastIncludedIndex {
-				ch <- Message{
-					Agreed: false,
-				}
-			} else {
-				rf.applyCh <- ApplyMsg{
-					SnapshotValid: true,
-					Snapshot:      msg.Data,
-					SnapshotTerm:  msg.PrevLogTerm,
-					SnapshotIndex: msg.PrevLogIdx,
-				}
-				ch <- Message{
-					Agreed: true,
-				}
-			}
+		rf.applyCh <- ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      msg.Data,
+			SnapshotTerm:  msg.PrevLogTerm,
+			SnapshotIndex: msg.PrevLogIdx,
+		}
+		ch <- Message{
+			PrevLogIdx:  msg.PrevLogIdx,
+			PrevLogTerm: msg.PrevLogTerm,
+			Agreed:      true,
+		}
+	}
+}
+
+func (rf *Raft) stepInstallSnapshotResponse(msg Message) {
+	if msg.Agreed {
+		if msg.PrevLogIdx > rf.vs.matchIdx[msg.From] {
+			rf.vs.matchIdx[msg.From] = msg.PrevLogIdx
+			rf.vs.nextIdx[msg.From] = msg.PrevLogIdx + 1
 		}
 	}
 }
 
 func (rf *Raft) stepSnapshot(index int, snapshot []byte) {
-	first := rf.firstLogIndex()
-	if first == -1 {
-		panic("invalid log state")
+	if index <= rf.ps.LastIncludedIndex {
+		DPrintf("warning, already snapshot until index %v", index)
+		return
 	}
+	_, lIndex := rf.lastLogInfo()
+	if index > lIndex {
+		DPrintf("error, index more than current log, index: %v, currentLogIndex: %v", index, lIndex)
+		return
+	}
+
+	keepLogIndex := rf.realLogIndex(index + 1)
+	entry := rf.entry(index)
 	rf.ps.LastIncludedIndex = index
-	rf.ps.LastIncludedTerm = rf.ps.Logs[index-first].Term
-	if index-first+1 == rf.lastLogIndex() {
-		rf.ps.Logs = nil
+	rf.ps.LastIncludedTerm = entry.Term
+	if keepLogIndex == -1 {
+		rf.ps.Logs = []LogEntry{}
 	} else {
-		rf.ps.Logs = rf.ps.Logs[index-first+1:]
+		rf.ps.Logs = rf.ps.Logs[keepLogIndex:]
 	}
+	rf.sn = snapshot
 	rf.persist()
+}
+
+func (rf *Raft) stepCondInstallSnapshot(lastIncludedIndex int, lastIncludedTerm int, snapshot []byte, ch chan<- Message) {
+	if rf.ps.LastIncludedIndex < lastIncludedIndex {
+		rf.ps.LastIncludedIndex = lastIncludedIndex
+		rf.ps.LastIncludedTerm = lastIncludedTerm
+		rf.sn = snapshot
+		logIndex := 0
+		find := false
+		for ; logIndex < len(rf.ps.Logs); logIndex++ {
+			if rf.ps.Logs[logIndex].Index > lastIncludedIndex {
+				find = true
+				break
+			}
+		}
+		if find {
+			rf.ps.Logs = rf.ps.Logs[logIndex:]
+		} else {
+			rf.ps.Logs = []LogEntry{}
+		}
+		rf.persist()
+		ch <- Message{
+			Agreed: true,
+		}
+	} else {
+		ch <- Message{
+			Agreed: false,
+		}
+	}
 }
 
 func (rf *Raft) becomeFollower(term int) {
@@ -951,7 +1018,7 @@ func (rf *Raft) distributeLog(server int, sync bool) {
 	var prevLogIdx, prevLogTerm int
 	nextIndex := rf.vs.nextIdx[server]
 	var msg Message
-	if nextIndex <= rf.firstLogIndex() {
+	if nextIndex <= rf.ps.LastIncludedIndex {
 		msg = Message{
 			MType:       MsgInstallSnapshotRequest,
 			From:        rf.me,
@@ -962,18 +1029,15 @@ func (rf *Raft) distributeLog(server int, sync bool) {
 			Data:        clone(rf.sn),
 		}
 	} else {
-		if rf.lastLogIndex() >= nextIndex {
-			entries = rf.ps.Logs[nextIndex-rf.firstLogIndex()-1:]
+		lTerm, lIndex := rf.lastLogInfo()
+		if lIndex >= nextIndex {
+			entries = rf.ps.Logs[rf.realLogIndex(nextIndex):]
 			prevLogIdx = nextIndex - 1
-			if prevLogIdx == rf.ps.LastIncludedIndex {
-				prevLogTerm = rf.ps.LastIncludedTerm
-			} else {
-				prevLogTerm = rf.ps.Logs[prevLogIdx-rf.firstLogIndex()-1].Term
-			}
+			prevLogTerm = rf.entry(prevLogIdx).Term
 		} else {
 			entries = nil
-			prevLogIdx = rf.lastLogIndex()
-			prevLogTerm = rf.lastLogTerm()
+			prevLogIdx = lIndex
+			prevLogTerm = lTerm
 		}
 		msg = Message{
 			MType:        MsgAppendRequest,
@@ -1047,6 +1111,32 @@ func (rf *Raft) sendMsg(msg Message) {
 							PrevLogTerm: reply.LastLogTerm,
 							PrevLogIdx:  reply.LastLogIndex,
 						}
+					}
+				}()
+			}
+		case MsgInstallSnapshotRequest:
+			if rf.state == Leader && msg.Term == rf.ps.CurrentTerm {
+				go func() {
+					reply := &InstallSnapshotReply{}
+					ok := rf.peers[msg.To].Call("InstallSnapshot", &InstallSnapshotArgs{
+						Term:              msg.Term,
+						LeaderId:          rf.me,
+						LastIncludedIndex: msg.PrevLogIdx,
+						LastIncludedTerm:  msg.PrevLogTerm,
+						Data:              msg.Data,
+					}, reply)
+					if ok {
+						rf.msgCh <- Message{
+							MType:      MsgInstallSnapshotResponse,
+							From:       msg.To,
+							To:         rf.me,
+							PrevLogIdx: reply.LastIncludedIndex,
+							Agreed:     true,
+						}
+					} else {
+						time.AfterFunc(TickUnit, func() {
+							rf.msgCh <- msg
+						})
 					}
 				}()
 			}
