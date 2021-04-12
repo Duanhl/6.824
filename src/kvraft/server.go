@@ -185,5 +185,6 @@ func (kv *KVServer) process(op Op) {
 }
 
 func (kv *KVServer) checkStateSize(applyIndex int) bool {
-	return applyIndex-kv.lastIncludedIndex >= kv.maxraftstate
+	return false
+	//return applyIndex-kv.lastIncludedIndex >= kv.maxraftstate
 }

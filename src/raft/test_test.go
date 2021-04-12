@@ -850,8 +850,9 @@ func TestFigure8Unreliable2C(t *testing.T) {
 		}
 	}
 
+	DPrintf("one")
 	cfg.one(rand.Int()%10000, servers, true)
-
+	DPrintf("test end")
 	cfg.end()
 }
 
