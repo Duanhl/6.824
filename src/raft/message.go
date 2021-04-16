@@ -32,6 +32,26 @@ type Message struct {
 	Agreed bool
 }
 
+type MessageSorter []Message
+
+func (ms MessageSorter) Len() int {
+	return len(ms)
+}
+
+func (ms MessageSorter) Swap(i, j int) {
+	ms[i], ms[j] = ms[j], ms[i]
+}
+
+func (ms MessageSorter) Less(i, j int) bool {
+	if ms[i].PrevLogIdx < ms[j].PrevLogIdx {
+		return false
+	} else if ms[i].PrevLogIdx == ms[j].PrevLogIdx {
+		return len(ms[i].Entries) < len(ms[j].Entries)
+	} else {
+		return true
+	}
+}
+
 type LogEntry struct {
 	Command interface{}
 	Term    int

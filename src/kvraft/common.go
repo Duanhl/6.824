@@ -1,5 +1,7 @@
 package kvraft
 
+import "sync"
+
 const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
@@ -29,6 +31,11 @@ type GetArgs struct {
 	Id int64
 }
 
+type Reply struct {
+	Err   Err
+	Value string
+}
+
 type GetReply struct {
 	Err   Err
 	Value string
@@ -51,4 +58,19 @@ type ClientMsg struct {
 
 	Err    Err
 	Leader int
+}
+
+type LinkedSet struct {
+	size   int
+	store  map[int]int
+	linked []int
+	mu     *sync.Mutex
+}
+
+func NewLinkedSet(size int) *LinkedSet {
+	return &LinkedSet{
+		size:   size,
+		store:  make(map[int]int),
+		linked: []int{},
+	}
 }

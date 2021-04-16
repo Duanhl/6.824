@@ -21,6 +21,7 @@ import (
 	"6.824/labgob"
 	"bytes"
 	"math/rand"
+	"sort"
 	"time"
 
 	//	"bytes"
@@ -236,7 +237,8 @@ type VolatileState struct {
 }
 
 type Ready struct {
-	msgs []Message
+	msgs     []Message
+	needSend bool
 }
 
 // return currentTerm and whether this server
@@ -271,7 +273,7 @@ func (rf *Raft) persist() {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.ps)
 	data := w.Bytes()
-	rf.persister.SaveStateAndSnapshot(data, rf.sn)
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -304,6 +306,10 @@ func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 		rf.sn = snapshot
 	}
 
+}
+
+func (rf *Raft) RaftStateSize() int {
+	return rf.persister.RaftStateSize()
 }
 
 //
@@ -624,12 +630,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.msgCh = make(chan Message, 128)
 	rf.resMap = make(map[int64]chan Message)
-	rf.ready = Ready{msgs: []Message{}}
+	rf.ready = Ready{msgs: []Message{}, needSend: false}
 
 	rf.tickCh = make(chan interface{}, 128)
-	rf.electionTimeout = 30 + rand.Int63n(30)
-	rf.heartbeatTimeout = rf.electionTimeout / 3
-	rf.elapsed = 0
+	rf.resetTimeout()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState(), persister.ReadSnapshot())
@@ -643,14 +647,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func (rf *Raft) mainLoop() {
 	for rf.killed() == false {
-		if len(rf.ready.msgs) > 0 {
+		if len(rf.ready.msgs) > 0 && rf.ready.needSend {
 			msgs := rf.ready.msgs
 			rf.remote(msgs)
 			rf.ready.msgs = []Message{}
+			rf.ready.needSend = false
 		}
 		select {
 		case <-rf.tickCh:
 			rf.tick()
+			rf.ready.needSend = true
 		case msg := <-rf.msgCh:
 			rf.stepMessage(msg)
 		}
@@ -927,9 +933,7 @@ func (rf *Raft) becomeFollower(term int) {
 }
 
 func (rf *Raft) becomeCandidate() {
-	rf.elapsed = 0
-	rf.electionTimeout = 30 + rand.Int63n(30)
-	rf.heartbeatTimeout = rf.electionTimeout / 3
+	rf.resetTimeout()
 
 	rf.ps.CurrentTerm += 1
 	rf.ps.VoteFor = rf.me
@@ -972,6 +976,12 @@ func (rf *Raft) grantedVote(server int) {
 	rf.ps.VoteFor = server
 	rf.elapsed = 0
 	rf.persist()
+}
+
+func (rf *Raft) resetTimeout() {
+	rf.electionTimeout = 40 + rand.Int63n(40)
+	rf.heartbeatTimeout = 20 + rand.Int63n(10)
+	rf.elapsed = 0
 }
 
 func (rf *Raft) distribute() {
@@ -1027,67 +1037,99 @@ func (rf *Raft) distributeLog(server int, sync bool) {
 }
 
 func (rf *Raft) remote(msgs []Message) {
+	voteReqs := make([]*Message, len(rf.peers))
+	appendReqs := make(map[int][]Message)
+	installReqs := make([]*Message, len(rf.peers))
 
+	for i := 0; i < len(msgs); i++ {
+		msg := msgs[i]
+		if msg.Term == rf.ps.CurrentTerm {
+			if rf.state == Candidate && msg.MType == MsgVoteRequest {
+				voteReqs[msg.To] = &msg
+			}
+			if rf.state == Leader && msg.MType == MsgAppendRequest {
+				if arr, ok := appendReqs[msg.To]; ok {
+					arr = append(arr, msg)
+				} else {
+					appendReqs[msg.To] = []Message{msg}
+				}
+			}
+			if rf.state == Leader && msg.MType == MsgInstallSnapshotRequest {
+				installReqs[msg.To] = &msg
+			}
+		}
+	}
+
+	for i := 0; i < len(rf.peers); i++ {
+		if voteReqs[i] != nil {
+			rf.send(*voteReqs[i])
+		}
+		if arr, ok := appendReqs[i]; ok {
+			if len(arr) > 0 {
+				sort.Sort(MessageSorter(arr))
+				rf.send(arr[len(arr)-1])
+			}
+		}
+		if installReqs[i] != nil {
+			rf.send(*installReqs[i])
+		}
+	}
 }
 
 func (rf *Raft) sendMsg(msg Message) {
 	rf.ready.msgs = append(rf.ready.msgs, msg)
+}
 
+func (rf *Raft) send(msg Message) {
 	switch msg.MType {
 	case MsgVoteRequest:
-		if rf.state == Candidate && msg.Term == rf.ps.CurrentTerm {
-			go func() {
-				reply := &RequestVoteReply{}
-				ok := rf.sendRequestVote(msg.To, &RequestVoteArgs{
-					Term:         msg.Term,
-					CandidateId:  rf.me,
-					LastLogIndex: msg.PrevLogIdx,
-					LastLogTerm:  msg.PrevLogTerm,
-				}, reply)
-				if !ok {
-					time.AfterFunc(TickUnit, func() {
-						rf.msgCh <- msg
-					})
-				} else {
-					rf.msgCh <- Message{
-						MType:  MsgVoteResponse,
-						From:   msg.To,
-						To:     rf.me,
-						Term:   reply.Term,
-						Agreed: reply.VoteGranted,
-					}
+		go func() {
+			reply := &RequestVoteReply{}
+			ok := rf.sendRequestVote(msg.To, &RequestVoteArgs{
+				Term:         msg.Term,
+				CandidateId:  rf.me,
+				LastLogIndex: msg.PrevLogIdx,
+				LastLogTerm:  msg.PrevLogTerm,
+			}, reply)
+			if !ok {
+				rf.msgCh <- msg
+			} else {
+				rf.msgCh <- Message{
+					MType:  MsgVoteResponse,
+					From:   msg.To,
+					To:     rf.me,
+					Term:   reply.Term,
+					Agreed: reply.VoteGranted,
 				}
-			}()
-		}
+			}
+		}()
+
 	case MsgAppendRequest:
-		if rf.state == Leader && msg.Term == rf.ps.CurrentTerm {
-			go func() {
-				reply := &AppendEntriesReply{}
-				ok := rf.sendAppendEntries(msg.To, &AppendEntriesArgs{
-					Term:         msg.Term,
-					LeaderId:     rf.me,
-					PrevLogIndex: msg.PrevLogIdx,
-					PrevLogTerm:  msg.PrevLogTerm,
-					Entries:      msg.Entries,
-					LeaderCommit: msg.LeaderCommit,
-				}, reply)
-				if !ok {
-					time.AfterFunc(TickUnit, func() {
-						rf.msgCh <- msg
-					})
-				} else {
-					rf.msgCh <- Message{
-						MType:       MsgAppendResponse,
-						From:        msg.To,
-						To:          rf.me,
-						Term:        reply.Term,
-						Agreed:      reply.Success,
-						PrevLogTerm: reply.LastLogTerm,
-						PrevLogIdx:  reply.LastLogIndex,
-					}
+		go func() {
+			reply := &AppendEntriesReply{}
+			ok := rf.sendAppendEntries(msg.To, &AppendEntriesArgs{
+				Term:         msg.Term,
+				LeaderId:     rf.me,
+				PrevLogIndex: msg.PrevLogIdx,
+				PrevLogTerm:  msg.PrevLogTerm,
+				Entries:      msg.Entries,
+				LeaderCommit: msg.LeaderCommit,
+			}, reply)
+			if !ok {
+				rf.msgCh <- msg
+			} else {
+				rf.msgCh <- Message{
+					MType:       MsgAppendResponse,
+					From:        msg.To,
+					To:          rf.me,
+					Term:        reply.Term,
+					Agreed:      reply.Success,
+					PrevLogTerm: reply.LastLogTerm,
+					PrevLogIdx:  reply.LastLogIndex,
 				}
-			}()
-		}
+			}
+		}()
+
 	case MsgInstallSnapshotRequest:
 		if rf.state == Leader && msg.Term == rf.ps.CurrentTerm {
 			go func() {
@@ -1108,9 +1150,7 @@ func (rf *Raft) sendMsg(msg Message) {
 						Agreed:     true,
 					}
 				} else {
-					time.AfterFunc(TickUnit, func() {
-						rf.msgCh <- msg
-					})
+					rf.msgCh <- msg
 				}
 			}()
 		}

@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 )
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -51,17 +51,52 @@ type KVServer struct {
 	lastIncludedIndex int
 	lastIncludedTerm  int
 
-	ticker chan struct{}
-	msgCh  chan Op
+	ticker     chan struct{}
+	opCh       chan Op
+	resMap     map[int64]chan Reply
+	indexIdMap map[int]int64
+}
+
+func (kv *KVServer) waitForRes(op Op) Reply {
+
+	kv.mu.Lock()
+	ch := make(chan Reply)
+	kv.resMap[op.Id] = ch
+	kv.opCh <- op
+	kv.mu.Unlock()
+
+	select {
+	case reply := <-ch:
+		return reply
+	}
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-
+	res := kv.waitForRes(Op{
+		Type: GET,
+		Id:   args.Id,
+		Key:  args.Key,
+	})
+	reply.Err = res.Err
+	reply.Value = res.Value
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	var ot OpType
+	if args.Op == "Put" {
+		ot = PUT
+	} else {
+		ot = APPEND
+	}
+	res := kv.waitForRes(Op{
+		Type:  ot,
+		Id:    args.Id,
+		Key:   args.Key,
+		Value: args.Value,
+	})
+	reply.Err = res.Err
 }
 
 //
@@ -78,6 +113,16 @@ func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	kv.rf.Kill()
+	for _, c := range kv.resMap {
+		c <- Reply{
+			Err: ErrNoKey,
+		}
+	}
+
 }
 
 func (kv *KVServer) killed() bool {
@@ -113,7 +158,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.ticker = make(chan struct{})
-	kv.msgCh = make(chan Op)
+	kv.opCh = make(chan Op)
+
+	kv.store = make(map[string]string)
+
+	kv.resMap = make(map[int64]chan Reply)
+	kv.indexIdMap = make(map[int]int64)
 
 	// You may need initialization code here.
 	go kv.run()
@@ -122,43 +172,47 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 }
 
 func (kv *KVServer) run() {
-	for {
-		select {
-		case applyMsg := <-kv.applyCh:
-			kv.apply(applyMsg)
-		case op := <-kv.msgCh:
-			kv.process(op)
+	if !kv.killed() {
+		for {
+			select {
+			case applyMsg := <-kv.applyCh:
+				kv.apply(applyMsg)
+			case op := <-kv.opCh:
+				kv.process(op)
+			}
 		}
 	}
 }
 
 func (kv *KVServer) apply(applyMsg raft.ApplyMsg) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
 	if applyMsg.CommandValid {
-		op := applyMsg.Command.(*Op)
-		switch op.Type {
-		case GET:
-			break
-		case PUT:
-			kv.store[op.Key] = op.Value
-		case APPEND:
-			if v, ok := kv.store[op.Key]; ok {
-				kv.store[op.Key] = v + op.Value
-			} else {
-				kv.store[op.Key] = op.Value
-			}
-		}
-		if kv.checkStateSize(applyMsg.CommandIndex) {
+		index := applyMsg.CommandIndex
+		op := applyMsg.Command.(Op)
 
+		var ch chan Reply
+		if id, ok := kv.indexIdMap[index]; ok {
+
+			kv.mu.Lock()
+			ch = kv.resMap[id]
+			delete(kv.resMap, id)
+			kv.mu.Unlock()
+
+			if op.Id != id {
+				ch <- Reply{Err: ErrWrongLeader}
+				kv.doApply(op, nil)
+			} else {
+				kv.doApply(op, &ch)
+			}
+		} else {
+			kv.doApply(op, nil)
+		}
+
+		if kv.checkStateSize() {
 			b := new(bytes.Buffer)
 			e := labgob.NewEncoder(b)
-
 			if err := e.Encode(kv.store); err != nil {
 				panic("encode store failed")
 			}
-
 			kv.lastIncludedIndex = applyMsg.CommandIndex
 			kv.rf.Snapshot(applyMsg.CommandIndex, b.Bytes())
 		}
@@ -180,11 +234,61 @@ func (kv *KVServer) apply(applyMsg raft.ApplyMsg) {
 	}
 }
 
+func (kv *KVServer) doApply(op Op, ch *chan Reply) {
+	switch op.Type {
+	case GET:
+		if ch != nil {
+			if v, ok := kv.store[op.Key]; ok {
+				*ch <- Reply{
+					Err:   OK,
+					Value: v,
+				}
+			} else {
+				*ch <- Reply{
+					Err: ErrNoKey,
+				}
+			}
+		}
+		break
+	case PUT:
+		kv.store[op.Key] = op.Value
+		if ch != nil {
+			*ch <- Reply{
+				Err: OK,
+			}
+		}
+	case APPEND:
+		if v, ok := kv.store[op.Key]; ok {
+			kv.store[op.Key] = v + op.Value
+		} else {
+			kv.store[op.Key] = op.Value
+		}
+		if ch != nil {
+			*ch <- Reply{
+				Err: OK,
+			}
+		}
+	}
+}
+
 func (kv *KVServer) process(op Op) {
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+
+		kv.mu.Lock()
+		ch := kv.resMap[op.Id]
+		kv.mu.Unlock()
+
+		ch <- Reply{
+			Err: ErrWrongLeader,
+		}
+	} else {
+		kv.indexIdMap[index] = op.Id
+	}
 
 }
 
-func (kv *KVServer) checkStateSize(applyIndex int) bool {
+func (kv *KVServer) checkStateSize() bool {
 	return false
-	//return applyIndex-kv.lastIncludedIndex >= kv.maxraftstate
+	//return kv.rf.RaftStateSize() > kv.maxraftstate
 }

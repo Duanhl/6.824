@@ -51,17 +51,20 @@ func (ck *Clerk) Get(key string) string {
 	}
 	reply := &GetReply{}
 	for true {
-		if ok := ck.servers[ck.leader].Call("Get", args, reply); ok {
+		DPrintf("client call get: (%v, %v)", args.Id, args.Key)
+		if ok := ck.servers[ck.leader].Call("KVServer.Get", args, reply); ok {
 			switch reply.Err {
 			case OK:
+				DPrintf("client call return: (%v, %v)", args.Id, reply.Value)
 				return reply.Value
 			case ErrNoKey:
+				DPrintf("client call return: (%v, '')", args.Id)
 				return ""
 			case ErrWrongLeader:
 				ck.loopForNextLeader()
 			}
 		} else {
-			time.Sleep(time.Millisecond * 20)
+			time.Sleep(time.Millisecond * 50)
 			ck.loopForNextLeader()
 		}
 	}
@@ -90,7 +93,7 @@ func (ck *Clerk) loopForNextLeader() {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 
-	args := PutAppendArgs{
+	args := &PutAppendArgs{
 		Key:   key,
 		Value: value,
 		Op:    op,
@@ -98,12 +101,14 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	}
 	reply := &PutAppendReply{}
 	for true {
-		if ok := ck.servers[ck.leader].Call("PutAppend", args, reply); ok {
+		DPrintf("client call %v: (%v, %v, %v)", args.Op, args.Id, args.Key, args.Value)
+		if ok := ck.servers[ck.leader].Call("KVServer.PutAppend", args, reply); ok {
 			switch reply.Err {
 			case OK:
+				DPrintf("client call putappend return: (%v, %v)", args.Id, reply.Err)
 				return
 			case ErrNoKey:
-				DPrintf("error return type")
+				DPrintf("error, client call putappend return: (%v)", args.Id)
 				return
 			case ErrWrongLeader:
 				ck.loopForNextLeader()
