@@ -21,6 +21,7 @@ import (
 	"6.824/labgob"
 	"bytes"
 	"errors"
+	"fmt"
 	"math/rand"
 	"time"
 
@@ -113,12 +114,6 @@ type HardState struct {
 	VoteFor     int
 	Logs        []LogEntry
 	LastApplied int
-}
-
-type Progress struct {
-	nextIndex  int
-	matchIndex int
-	voteForMe  bool
 }
 
 // return currentTerm and whether this server
@@ -398,7 +393,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		resCh := rf.transport.waitForRPCRes(Message{
 			MType:   MsgAppendCommand,
 			Command: command,
-			From:    -1,
+			From:    None,
 		})
 		select {
 		case msg := <-resCh:
@@ -479,12 +474,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, len(peers))
 
 	transport := &Transport{
-		pees:  peers,
-		recv:  make(chan Message, 128),
-		out:   make(chan Message, 128),
-		rpcm:  make(map[int64]chan Message),
-		term:  rf.currentTerm,
-		state: rf.state,
+		rf:   rf,
+		recv: make(chan Message, 128),
+		out:  make(chan Message, 128),
+		rpcm: make(map[int64]chan Message),
 	}
 	rf.transport = transport
 
@@ -558,18 +551,16 @@ func (rf *Raft) sendAppendEntries(server int) {
 }
 
 func (rf *Raft) becomeFollower(term int) {
-	rf.elecElapsed = 0
+	rf.restElecElapsed()
 	rf.state = Follower
-	rf.transport.state = Follower
 
-	if term > rf.currentTerm {
-		rf.currentTerm = term
-		rf.storage.term = term
-		rf.transport.term = term
-		rf.voteFor = None
+	rf.stepFunc = stepFollower
 
-		rf.persist()
-	}
+	rf.currentTerm = term
+	rf.storage.term = term
+	rf.voteFor = None
+
+	rf.persist()
 }
 
 func (rf *Raft) becomeCandidate() {
@@ -578,17 +569,16 @@ func (rf *Raft) becomeCandidate() {
 	rf.currentTerm++
 	rf.voteFor = rf.me
 	rf.state = Candidate
-
 	rf.storage.term = rf.currentTerm
-	rf.transport.state = Candidate
-	rf.transport.term = rf.currentTerm
+
+	rf.stepFunc = stepCandidate
 
 	rf.persist()
 	rf.startElection()
 }
 
 func (rf *Raft) startElection() {
-	lastTerm, lastIndex := rf.storage.lastLogInfo()
+	lastTerm, lastIndex := rf.storage.mostContainsInfo()
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			rf.votes[i] = false
@@ -608,9 +598,9 @@ func (rf *Raft) startElection() {
 
 func (rf *Raft) becomeLeader() {
 	rf.state = Leader
-	rf.transport.state = Leader
+	rf.stepFunc = stepLeader
 
-	_, lastIndex := rf.storage.lastLogInfo()
+	_, lastIndex := rf.storage.mostContainsInfo()
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			rf.matchIndex[i] = lastIndex
@@ -626,11 +616,173 @@ func (rf *Raft) becomeLeader() {
 
 func (rf *Raft) step(msg Message) {
 
+	if msg.From == rf.me {
+		// need send
+		rf.transport.out <- msg
+
+	} else if msg.From == None {
+		// local msg
+		rf.stepFunc(rf, msg)
+
+	} else {
+		// process msg
+		if msg.Term < rf.currentTerm {
+			rf.reject(msg)
+			return
+		}
+
+		if msg.Term > rf.currentTerm {
+			rf.becomeFollower(msg.Term)
+		}
+
+		if msg.Term == rf.currentTerm {
+			switch msg.MType {
+			// process vote request
+			case MsgVoteRequest:
+				if rf.voteFor == None && !rf.storage.isUpToDate(msg.PrevLogTerm, msg.PrevLogIdx) {
+					rf.grantedVote(msg)
+				} else {
+					rf.reject(msg)
+				}
+				break
+
+			// process append entries request
+			case MsgAppendRequest:
+				if rf.state == Leader {
+					panic(fmt.Errorf("exists two leader : %v and %v in current term: %v", rf.me, msg.From, rf.currentTerm))
+				}
+
+				if rf.state == Candidate {
+					rf.becomeFollower(msg.Term)
+				}
+
+				rf.restElecElapsed()
+
+				if rf.storage.match(msg.PrevLogTerm, msg.PrevLogIdx) {
+					matchIndex := rf.storage.appendLogEntries(msg.PrevLogIdx, msg.Entries)
+					rf.storage.commit(Min(matchIndex, msg.LeaderCommit))
+					rf.transport.out <- Message{
+						MType:      MsgAppendResponse,
+						From:       rf.me,
+						To:         msg.From,
+						Id:         msg.Id,
+						Agreed:     true,
+						Term:       rf.currentTerm,
+						PrevLogIdx: matchIndex,
+					}
+				} else {
+					rf.reject(msg)
+				}
+				break
+
+			case MsgInstallSnapshotRequest:
+				rf.reject(msg)
+				break
+
+			default:
+				rf.stepFunc(rf, msg)
+			}
+		}
+	}
+}
+
+func (rf *Raft) reject(msg Message) {
+	var mtype MessageType
+	switch msg.MType {
+	case MsgVoteRequest:
+		mtype = MsgVoteResponse
+		break
+	case MsgAppendRequest:
+		mtype = MsgAppendResponse
+		break
+	case MsgInstallSnapshotRequest:
+		mtype = MsgInstallSnapshotResponse
+		break
+	}
+	rf.transport.out <- Message{
+		MType:  mtype,
+		From:   rf.me,
+		To:     msg.From,
+		Id:     msg.Id,
+		Agreed: false,
+		Term:   rf.currentTerm,
+	}
+}
+
+func (rf *Raft) grantedVote(msg Message) {
+	rf.voteFor = msg.From
+	rf.restElecElapsed()
+	rf.persist()
+
+	rf.transport.out <- Message{
+		MType:  MsgVoteResponse,
+		From:   rf.me,
+		To:     msg.From,
+		Id:     msg.Id,
+		Agreed: true,
+		Term:   rf.currentTerm,
+	}
+}
+
+func (rf *Raft) restElecElapsed() {
+	rf.elecElapsed = 0
 }
 
 func (rf *Raft) resetElecTimeout() {
 	rf.elecTimeout = ElectionBase + rand.Int63n(ElectionBase)
 	rf.elecElapsed = 0
+}
+
+func stepFollower(rf *Raft, msg Message) {
+	switch msg.MType {
+	case MsgAppendCommand:
+		rf.transport.out <- Message{
+			Id:          msg.Id,
+			From:        rf.me,
+			To:          None,
+			PrevLogIdx:  -1,
+			PrevLogTerm: -1,
+			Agreed:      false,
+		}
+	}
+}
+
+func stepCandidate(rf *Raft, msg Message) {
+	switch msg.MType {
+	case MsgAppendRequest:
+		rf.becomeFollower(msg.Term)
+		break
+	case MsgVoteResponse:
+		if msg.Agreed {
+			rf.votes[msg.From] = true
+		}
+
+		if Count(rf.votes) == len(rf.peers)/2+1 {
+			rf.becomeLeader()
+		}
+		break
+	default:
+		// just discard message
+	}
+}
+
+func stepLeader(rf *Raft, msg Message) {
+	switch msg.MType {
+	case MsgAppendResponse:
+		if msg.Agreed && msg.PrevLogIdx > rf.matchIndex[msg.From] {
+			rf.matchIndex[msg.From] = msg.PrevLogIdx
+			rf.nextIndex[msg.From] = msg.PrevLogIdx + 1
+			mayCommitIndex := Majority(rf.matchIndex)
+			rf.storage.commit(mayCommitIndex)
+		}
+
+		if !msg.Agreed {
+			rf.nextIndex[msg.From]--
+		}
+		break
+	default:
+		// just discard message
+	}
 }
 
 /****      Storage Begin                ******/
@@ -660,6 +812,34 @@ func (storage *Storage) lastLogInfo() (int, int) {
 	}
 }
 
+func (storage *Storage) mostContainsInfo() (int, int) {
+	if len(storage.ents) == 0 {
+		return storage.sn.LastIncludedTerm, storage.sn.LastIncludedIndex
+	} else {
+		return storage.ents[len(storage.ents)-1].Term, storage.ents[len(storage.ents)-1].Index
+	}
+}
+
+func (storage *Storage) fromEntries(index int) (int, int, []LogEntry) {
+	if entry, err := storage.entryAt(index - 1); err == nil {
+		_, firstLogIndex := storage.firstLogInfo()
+		_, lastLogIndex := storage.lastLogInfo()
+		if index > lastLogIndex {
+			return entry.Term, entry.Index, nil
+		} else {
+			return entry.Term, entry.Index, storage.ents[index-firstLogIndex:]
+		}
+	} else {
+		if index == storage.sn.LastIncludedIndex+1 {
+			entries := make([]LogEntry, len(storage.ents))
+			copy(entries, storage.ents)
+			return storage.sn.LastIncludedTerm, storage.sn.LastIncludedTerm, entries
+		} else {
+			return -1, -1, nil
+		}
+	}
+}
+
 func (storage *Storage) entryAt(index int) (LogEntry, error) {
 	if len(storage.ents) == 0 || index < storage.ents[0].Index || index > storage.ents[len(storage.ents)-1].Index {
 		return LogEntry{}, NoSuchEntryError
@@ -670,13 +850,8 @@ func (storage *Storage) entryAt(index int) (LogEntry, error) {
 }
 
 func (storage *Storage) isUpToDate(otherTerm int, otherIndex int) bool {
-	if len(storage.ents) == 0 {
-		return storage.sn.LastIncludedTerm > otherTerm ||
-			(otherTerm == storage.sn.LastIncludedTerm && storage.sn.LastIncludedIndex > otherIndex)
-	} else {
-		term, index := storage.lastLogInfo()
-		return term > otherTerm || (term == otherTerm && index > otherIndex)
-	}
+	lastTerm, lastIndex := storage.mostContainsInfo()
+	return lastTerm > otherTerm || (lastTerm == otherTerm && lastIndex > otherIndex)
 }
 
 func (storage *Storage) match(otherTerm int, otherIndex int) bool {
@@ -762,23 +937,19 @@ func (storage *Storage) appendLogEntries(matchIndex int, logs []LogEntry) int {
 	return logs[len(logs)-1].Index
 }
 
-func (storage *Storage) snapshot(index int, snapshot []byte) {
+func (storage *Storage) installSnapshot(term int, index int, snapshot []byte) {
 	if index <= storage.sn.LastIncludedIndex {
 		return
 	}
-	// todo, must contains entry at index
-	if entry, err := storage.entryAt(index); err == nil {
-		storage.sn.LastIncludedIndex = index
-		storage.sn.LastIncludedTerm = entry.Term
-		storage.sn.Data = snapshot
 
-		_, firstIndex := storage.firstLogInfo()
-		_, lastIndex := storage.lastLogInfo()
-		if index+1 > lastIndex {
-			storage.ents = []LogEntry{}
-		} else {
-			storage.ents = storage.ents[index+1-firstIndex:]
-		}
+	storage.sn.LastIncludedIndex = index
+	storage.sn.LastIncludedTerm = term
+	storage.sn.Data = snapshot
+	if _, err := storage.entryAt(index + 1); err == nil {
+		firstIndex := storage.ents[0].Index
+		storage.ents = storage.ents[index+1-firstIndex:]
+	} else {
+		storage.ents = []LogEntry{}
 	}
 }
 
@@ -787,16 +958,13 @@ func (storage *Storage) snapshot(index int, snapshot []byte) {
 /****      Transport Start   ****/
 
 type Transport struct {
-	pees []*labrpc.ClientEnd
+	rf *Raft
 
 	recv chan Message
 	out  chan Message
 	rpcm map[int64]chan Message
 
 	lock sync.Mutex
-
-	term  int
-	state ServerState
 
 	flag int32
 }
@@ -817,19 +985,23 @@ func (ts *Transport) loop() {
 	for !ts.stopped() {
 		select {
 		case msg := <-ts.out:
-			if msg.MType == MsgVoteRequest || msg.MType == MsgAppendRequest || msg.MType == MsgInstallSnapshotRequest {
-				ts.remote(msg)
-			} else if msg.MType == MsgVoteResponse || msg.MType == MsgAppendResponse || msg.MType == MsgInstallSnapshotResponse {
-				ts.responseRPC(msg)
+			if msg.To != None {
+				if msg.MType == MsgVoteRequest || msg.MType == MsgAppendRequest || msg.MType == MsgInstallSnapshotRequest {
+					ts.remote(msg)
+				} else if msg.MType == MsgVoteResponse || msg.MType == MsgAppendResponse || msg.MType == MsgInstallSnapshotResponse {
+					ts.responseRPC(msg)
+				} else {
+					DPrintf("warning: error msg type: %v", msg.MType)
+				}
 			} else {
-				DPrintf("warning: error msg type: %v", msg.MType)
+				ts.responseRPC(msg)
 			}
 		}
 	}
 }
 
 func (ts *Transport) remote(msg Message) {
-	if msg.Term < ts.term {
+	if msg.Term < ts.rf.currentTerm {
 		// discard outdate msg
 		return
 	}
@@ -837,7 +1009,7 @@ func (ts *Transport) remote(msg Message) {
 
 	// only send when candidate
 	case MsgVoteRequest:
-		if ts.state == Candidate {
+		if ts.rf.state == Candidate {
 			args := &RequestVoteArgs{
 				Term:         msg.Term,
 				CandidateId:  msg.From,
@@ -845,7 +1017,7 @@ func (ts *Transport) remote(msg Message) {
 				LastLogTerm:  msg.PrevLogTerm,
 			}
 			reply := &RequestVoteReply{}
-			if ok := ts.pees[msg.To].Call("Raft.RequestVote", args, reply); ok {
+			if ok := ts.rf.peers[msg.To].Call("Raft.RequestVote", args, reply); ok {
 				ts.recv <- Message{
 					MType:  MsgVoteResponse,
 					From:   msg.To,
@@ -861,7 +1033,7 @@ func (ts *Transport) remote(msg Message) {
 
 	// only send when Leader
 	case MsgAppendRequest:
-		if ts.state == Leader {
+		if ts.rf.state == Leader {
 			args := &AppendEntriesArgs{
 				Term:         msg.Term,
 				LeaderId:     msg.From,
@@ -871,7 +1043,7 @@ func (ts *Transport) remote(msg Message) {
 				LeaderCommit: msg.LeaderCommit,
 			}
 			reply := &AppendEntriesReply{}
-			if ok := ts.pees[msg.To].Call("Raft.AppendEntries", args, reply); ok {
+			if ok := ts.rf.peers[msg.To].Call("Raft.AppendEntries", args, reply); ok {
 				ts.recv <- Message{
 					MType:      MsgAppendResponse,
 					Term:       msg.Term,
@@ -888,7 +1060,7 @@ func (ts *Transport) remote(msg Message) {
 
 	// only send when Leader
 	case MsgInstallSnapshotRequest:
-		if ts.state == Leader {
+		if ts.rf.state == Leader {
 			args := &InstallSnapshotArgs{
 				Term:              msg.Term,
 				LeaderId:          msg.From,
@@ -897,7 +1069,7 @@ func (ts *Transport) remote(msg Message) {
 				Data:              msg.Data,
 			}
 			reply := &InstallSnapshotReply{}
-			if ok := ts.pees[msg.To].Call("Raft.InstallSnapshot", args, reply); ok {
+			if ok := ts.rf.peers[msg.To].Call("Raft.InstallSnapshot", args, reply); ok {
 				ts.recv <- Message{
 					MType:      MsgInstallSnapshotResponse,
 					From:       msg.To,
@@ -935,7 +1107,7 @@ func (ts *Transport) stop() {
 	defer ts.lock.Unlock()
 	for _, ch := range ts.rpcm {
 		ch <- Message{
-			Term:   ts.term,
+			Term:   ts.rf.currentTerm,
 			Agreed: false,
 		}
 	}

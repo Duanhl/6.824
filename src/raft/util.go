@@ -36,3 +36,13 @@ func Majority(arr []int) int {
 	sort.Ints(target)
 	return target[quorum]
 }
+
+func Count(arr []bool) int {
+	count := 0
+	for i := 0; i < len(arr); i++ {
+		if arr[i] {
+			count++
+		}
+	}
+	return count
+}
