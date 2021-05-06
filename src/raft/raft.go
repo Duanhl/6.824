@@ -105,8 +105,6 @@ type Raft struct {
 	hbTimeout   int64
 	elecElapsed int64
 	hbElapsed   int64
-
-	stepFunc func(rf *Raft, msg Message)
 }
 
 type HardState struct {
@@ -564,8 +562,6 @@ func (rf *Raft) becomeFollower(term int) {
 	rf.restElecElapsed()
 	rf.state = Follower
 
-	rf.stepFunc = stepFollower
-
 	rf.currentTerm = term
 	rf.storage.term = term
 	rf.voteFor = None
@@ -580,8 +576,6 @@ func (rf *Raft) becomeCandidate() {
 	rf.voteFor = rf.me
 	rf.state = Candidate
 	rf.storage.term = rf.currentTerm
-
-	rf.stepFunc = stepCandidate
 
 	rf.persist()
 	rf.startElection()
@@ -608,7 +602,6 @@ func (rf *Raft) startElection() {
 
 func (rf *Raft) becomeLeader() {
 	rf.state = Leader
-	rf.stepFunc = stepLeader
 
 	_, lastIndex := rf.storage.mostContainsInfo()
 	for i := 0; i < len(rf.peers); i++ {
@@ -660,8 +653,27 @@ func (rf *Raft) step(msg Message) {
 				Agreed: result,
 			}
 			break
+
+		case MsgAppendCommand:
+			result := Message{
+				Id:   msg.Id,
+				From: rf.me,
+				To:   None,
+			}
+			if rf.state == Leader {
+				term, index := rf.storage.appendCommand(rf.me, msg.Command)
+				rf.matchIndex[rf.me] = index
+				result.PrevLogTerm = term
+				result.PrevLogIdx = index
+				rf.transport.out <- result
+				rf.hbElapsed = rf.hbTimeout
+			} else {
+				result.PrevLogTerm = -1
+				result.PrevLogIdx = -1
+				rf.transport.out <- result
+			}
 		default:
-			rf.stepFunc(rf, msg)
+			DPrintf("unsupported msg type: %v", msg)
 		}
 
 	} else {
@@ -672,6 +684,10 @@ func (rf *Raft) step(msg Message) {
 		}
 
 		if msg.Term > rf.currentTerm {
+			rf.becomeFollower(msg.Term)
+		}
+
+		if msg.Term == rf.currentTerm && msg.MType == MsgAppendRequest && rf.state == Candidate {
 			rf.becomeFollower(msg.Term)
 		}
 
@@ -690,10 +706,6 @@ func (rf *Raft) step(msg Message) {
 			case MsgAppendRequest:
 				if rf.state == Leader {
 					panic(fmt.Errorf("exists two leader : %v and %v in current term: %v", rf.me, msg.From, rf.currentTerm))
-				}
-
-				if rf.state == Candidate {
-					rf.becomeFollower(msg.Term)
 				}
 
 				rf.restElecElapsed()
@@ -719,8 +731,40 @@ func (rf *Raft) step(msg Message) {
 				rf.reject(msg)
 				break
 
+			case MsgVoteResponse:
+				if rf.state == Candidate {
+					if msg.Agreed {
+						rf.votes[msg.From] = true
+					}
+
+					if Count(rf.votes) == len(rf.peers)/2+1 {
+						rf.becomeLeader()
+					}
+					break
+				}
+
+			case MsgAppendResponse:
+				if rf.state == Leader {
+					if msg.Agreed && msg.PrevLogIdx > rf.matchIndex[msg.From] {
+						rf.matchIndex[msg.From] = msg.PrevLogIdx
+						rf.nextIndex[msg.From] = msg.PrevLogIdx + 1
+						mayCommitIndex := Majority(rf.matchIndex)
+						rf.storage.commit(mayCommitIndex)
+					}
+
+					if !msg.Agreed {
+						rf.nextIndex[msg.From]--
+
+						if rf.nextIndex[msg.From] <= rf.matchIndex[msg.From] {
+							DPrintf("error, leader %v has a committed next index %v for follower %v",
+								rf.me, rf.nextIndex[msg.From], msg.From)
+							rf.nextIndex[msg.From] = rf.matchIndex[msg.From] + 1
+						}
+					}
+				}
+				break
 			default:
-				rf.stepFunc(rf, msg)
+				DPrintf("unsupported message type, msg: %v", msg)
 			}
 		}
 	}
@@ -771,87 +815,6 @@ func (rf *Raft) restElecElapsed() {
 func (rf *Raft) resetElecTimeout() {
 	rf.elecTimeout = ElectionBase + rand.Int63n(ElectionBase)
 	rf.elecElapsed = 0
-}
-
-func stepFollower(rf *Raft, msg Message) {
-	switch msg.MType {
-	case MsgAppendCommand:
-		rf.transport.out <- Message{
-			Id:          msg.Id,
-			From:        rf.me,
-			To:          None,
-			PrevLogIdx:  -1,
-			PrevLogTerm: -1,
-			Agreed:      false,
-		}
-	default:
-		DPrintf("unsupported msg : %v", msg)
-	}
-}
-
-func stepCandidate(rf *Raft, msg Message) {
-	switch msg.MType {
-	case MsgAppendCommand:
-		rf.transport.out <- Message{
-			Id:          msg.Id,
-			From:        rf.me,
-			To:          None,
-			PrevLogIdx:  -1,
-			PrevLogTerm: -1,
-			Agreed:      false,
-		}
-	case MsgVoteResponse:
-		if msg.Agreed {
-			rf.votes[msg.From] = true
-		}
-
-		if Count(rf.votes) == len(rf.peers)/2+1 {
-			rf.becomeLeader()
-		}
-		break
-	default:
-		DPrintf("unsupported msg : %v", msg)
-	}
-}
-
-func stepLeader(rf *Raft, msg Message) {
-	switch msg.MType {
-	case MsgVoteResponse:
-		break
-	case MsgAppendCommand:
-		term, index := rf.storage.appendCommand(rf.me, msg.Command)
-		rf.matchIndex[rf.me] = index
-		rf.transport.out <- Message{
-			Id:          msg.Id,
-			From:        rf.me,
-			To:          None,
-			PrevLogIdx:  index,
-			PrevLogTerm: term,
-			Agreed:      true,
-		}
-		//rf.hbElapsed = rf.hbTimeout
-		break
-	case MsgAppendResponse:
-		if msg.Agreed && msg.PrevLogIdx > rf.matchIndex[msg.From] {
-			rf.matchIndex[msg.From] = msg.PrevLogIdx
-			rf.nextIndex[msg.From] = msg.PrevLogIdx + 1
-			mayCommitIndex := Majority(rf.matchIndex)
-			rf.storage.commit(mayCommitIndex)
-		}
-
-		if !msg.Agreed {
-			rf.nextIndex[msg.From]--
-
-			if rf.nextIndex[msg.From] <= rf.matchIndex[msg.From] {
-				DPrintf("error, leader %v has a committed next index %v for follower %v",
-					rf.me, rf.nextIndex[msg.From], msg.From)
-				rf.nextIndex[msg.From] = rf.matchIndex[msg.From] + 1
-			}
-		}
-		break
-	default:
-		DPrintf("unsupported msg : %v", msg)
-	}
 }
 
 /****      Storage Begin                ******/
