@@ -507,6 +507,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.run()
+	go rf.transport.run()
 
 	return rf
 }
@@ -544,9 +545,17 @@ func (rf *Raft) heartbeat() {
 
 func (rf *Raft) sendAppendEntries(server int) {
 	if server != rf.me {
-		//var prevLogIndex, prevLogTerm int
-		//var entries []LogEntry
-
+		prevLogIndex, prevLogTerm, entries := rf.storage.fromEntries(rf.nextIndex[server])
+		rf.transport.out <- Message{
+			MType:        MsgAppendRequest,
+			From:         rf.me,
+			To:           server,
+			Term:         rf.currentTerm,
+			PrevLogIdx:   prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			Entries:      entries,
+			LeaderCommit: rf.storage.commitIndex,
+		}
 	}
 }
 
@@ -622,7 +631,37 @@ func (rf *Raft) step(msg Message) {
 
 	} else if msg.From == None {
 		// local msg
-		rf.stepFunc(rf, msg)
+		switch msg.MType {
+		case MsgSnapshot:
+			if entry, err := rf.storage.entryAt(msg.PrevLogIdx); err == nil {
+				rf.storage.installSnapshot(entry.Term, entry.Index, msg.Data)
+			} else {
+				_, lastLogIndex := rf.storage.mostContainsInfo()
+				if msg.PrevLogIdx > lastLogIndex {
+					panic(fmt.Errorf("some committed log entry has lost in storage: %v", rf.me))
+				}
+			}
+			rf.transport.out <- Message{
+				MType: MsgSnapshot,
+				Id:    msg.Id,
+				From:  rf.me,
+				To:    None,
+			}
+			break
+
+		case MsgConInstallSnapshot:
+			result := rf.storage.installSnapshot(msg.PrevLogTerm, msg.PrevLogIdx, msg.Data)
+			rf.transport.out <- Message{
+				MType:  MsgSnapshot,
+				Id:     msg.Id,
+				From:   rf.me,
+				To:     None,
+				Agreed: result,
+			}
+			break
+		default:
+			rf.stepFunc(rf, msg)
+		}
 
 	} else {
 		// process msg
@@ -659,7 +698,7 @@ func (rf *Raft) step(msg Message) {
 				rf.restElecElapsed()
 
 				if rf.storage.match(msg.PrevLogTerm, msg.PrevLogIdx) {
-					matchIndex := rf.storage.appendLogEntries(msg.PrevLogIdx, msg.Entries)
+					matchIndex := rf.storage.appendLogEntries(rf.me, msg.PrevLogIdx, msg.Entries)
 					rf.storage.commit(Min(matchIndex, msg.LeaderCommit))
 					rf.transport.out <- Message{
 						MType:      MsgAppendResponse,
@@ -744,14 +783,22 @@ func stepFollower(rf *Raft, msg Message) {
 			PrevLogTerm: -1,
 			Agreed:      false,
 		}
+	default:
+		DPrintf("unsupported msg : %v", msg)
 	}
 }
 
 func stepCandidate(rf *Raft, msg Message) {
 	switch msg.MType {
-	case MsgAppendRequest:
-		rf.becomeFollower(msg.Term)
-		break
+	case MsgAppendCommand:
+		rf.transport.out <- Message{
+			Id:          msg.Id,
+			From:        rf.me,
+			To:          None,
+			PrevLogIdx:  -1,
+			PrevLogTerm: -1,
+			Agreed:      false,
+		}
 	case MsgVoteResponse:
 		if msg.Agreed {
 			rf.votes[msg.From] = true
@@ -762,12 +809,26 @@ func stepCandidate(rf *Raft, msg Message) {
 		}
 		break
 	default:
-		// just discard message
+		DPrintf("unsupported msg : %v", msg)
 	}
 }
 
 func stepLeader(rf *Raft, msg Message) {
 	switch msg.MType {
+	case MsgVoteResponse:
+		break
+	case MsgAppendCommand:
+		term, index := rf.storage.appendCommand(msg.Command)
+		rf.matchIndex[rf.me] = index
+		rf.transport.out <- Message{
+			Id:          msg.Id,
+			From:        rf.me,
+			To:          None,
+			PrevLogIdx:  index,
+			PrevLogTerm: term,
+			Agreed:      true,
+		}
+		break
 	case MsgAppendResponse:
 		if msg.Agreed && msg.PrevLogIdx > rf.matchIndex[msg.From] {
 			rf.matchIndex[msg.From] = msg.PrevLogIdx
@@ -781,7 +842,7 @@ func stepLeader(rf *Raft, msg Message) {
 		}
 		break
 	default:
-		// just discard message
+		DPrintf("unsupported msg : %v", msg)
 	}
 }
 
@@ -895,7 +956,7 @@ func (storage *Storage) apply() {
 	}
 }
 
-func (storage *Storage) appendCommand(command interface{}) {
+func (storage *Storage) appendCommand(command interface{}) (int, int) {
 	var entry LogEntry
 	if len(storage.ents) == 0 {
 		entry = LogEntry{
@@ -912,9 +973,10 @@ func (storage *Storage) appendCommand(command interface{}) {
 		}
 	}
 	storage.ents = append(storage.ents, entry)
+	return entry.Term, entry.Index
 }
 
-func (storage *Storage) appendLogEntries(matchIndex int, logs []LogEntry) int {
+func (storage *Storage) appendLogEntries(server int, matchIndex int, logs []LogEntry) int {
 	var start int
 	if matchIndex == storage.sn.LastIncludedIndex {
 		start = 0
@@ -934,12 +996,19 @@ func (storage *Storage) appendLogEntries(matchIndex int, logs []LogEntry) int {
 	if conflictMy > -1 {
 		storage.ents = append(storage.ents[:conflictMy], logs[conflictOther:]...)
 	}
-	return logs[len(logs)-1].Index
+
+	DPrintf("server %v storage is: %s", server, storage.String())
+	if len(logs) > 0 {
+		return logs[len(logs)-1].Index
+	} else {
+		return matchIndex
+	}
+
 }
 
-func (storage *Storage) installSnapshot(term int, index int, snapshot []byte) {
+func (storage *Storage) installSnapshot(term int, index int, snapshot []byte) bool {
 	if index <= storage.sn.LastIncludedIndex {
-		return
+		return false
 	}
 
 	storage.sn.LastIncludedIndex = index
@@ -951,6 +1020,21 @@ func (storage *Storage) installSnapshot(term int, index int, snapshot []byte) {
 	} else {
 		storage.ents = []LogEntry{}
 	}
+	return true
+}
+
+func (storage *Storage) String() string {
+	l := len(storage.ents)
+	if l == 0 {
+		return fmt.Sprintf("{%v, %v, %v}", storage.commitIndex,
+			storage.sn.LastIncludedTerm, storage.sn.LastIncludedIndex)
+	} else {
+		return fmt.Sprintf("{%v, %v, %v, [(%v, %v), (%v, %v)]}", storage.commitIndex,
+			storage.sn.LastIncludedTerm, storage.sn.LastIncludedIndex,
+			storage.ents[0].Term, storage.ents[0].Index,
+			storage.ents[l-1].Term, storage.ents[l-1].Index)
+	}
+
 }
 
 /****      Storage End                ******/
@@ -967,6 +1051,8 @@ type Transport struct {
 	lock sync.Mutex
 
 	flag int32
+
+	rpcCount int
 }
 
 func (ts *Transport) waitForRPCRes(request Message) <-chan Message {
@@ -975,19 +1061,23 @@ func (ts *Transport) waitForRPCRes(request Message) <-chan Message {
 
 	id := rand.Int63()
 	ch := make(chan Message)
+	request.Id = id
 	ts.rpcm[id] = ch
 	ts.recv <- request
 
 	return ch
 }
 
-func (ts *Transport) loop() {
+func (ts *Transport) run() {
 	for !ts.stopped() {
 		select {
 		case msg := <-ts.out:
 			if msg.To != None {
 				if msg.MType == MsgVoteRequest || msg.MType == MsgAppendRequest || msg.MType == MsgInstallSnapshotRequest {
-					ts.remote(msg)
+					ts.rpcCount++
+					go func() {
+						ts.remote(msg)
+					}()
 				} else if msg.MType == MsgVoteResponse || msg.MType == MsgAppendResponse || msg.MType == MsgInstallSnapshotResponse {
 					ts.responseRPC(msg)
 				} else {
@@ -1111,7 +1201,7 @@ func (ts *Transport) stop() {
 			Agreed: false,
 		}
 	}
-	ts.rpcm = nil
+	DPrintf("server %v rpc count:%v", ts.rf.me, ts.rpcCount)
 }
 
 /****      Transport End    ****/
