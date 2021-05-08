@@ -11,7 +11,7 @@ const (
 	MsgInstallSnapshotRequest
 	MsgInstallSnapshotResponse
 	MsgSnapshot
-	MsgConInstallSnapshot
+	MsgCondInstallSnapshot
 
 	MsgAppendCommand
 )
@@ -30,6 +30,8 @@ type Message struct {
 	Data         []byte
 
 	Agreed bool
+
+	Retry int
 }
 
 type MessageSorter []Message
