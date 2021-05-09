@@ -748,11 +748,11 @@ func (rf *Raft) resetElecTimeout() {
 }
 
 func (rf *Raft) triggerHeartbeat(syncNow bool) {
-	if syncNow {
-		rf.hbElapsed = rf.hbTimeout
-	} else {
-		rf.hbElapsed++
-	}
+	//if syncNow {
+	rf.hbElapsed = rf.hbTimeout
+	//} else {
+	//	rf.hbElapsed++
+	//}
 }
 
 func stepFollower(rf *Raft, msg Message) {
@@ -786,7 +786,7 @@ func stepFollower(rf *Raft, msg Message) {
 		break
 
 	case MsgInstallSnapshotRequest:
-		rf.storage.snapshot(msg.PrevLogTerm, msg.PrevLogIdx, msg.Data)
+		rf.storage.applySnapshot(msg.PrevLogTerm, msg.PrevLogIdx, msg.Data)
 		rf.sendMessage(Message{
 			MType:  MsgInstallSnapshotResponse,
 			Id:     msg.Id,
@@ -813,7 +813,7 @@ func stepCandidate(rf *Raft, msg Message) {
 		break
 
 	case MsgInstallSnapshotRequest:
-		rf.storage.snapshot(msg.PrevLogTerm, msg.PrevLogIdx, msg.Data)
+		rf.storage.applySnapshot(msg.PrevLogTerm, msg.PrevLogIdx, msg.Data)
 		rf.sendMessage(Message{
 			MType:  MsgInstallSnapshotResponse,
 			Id:     msg.Id,
@@ -856,11 +856,7 @@ func stepLeader(rf *Raft, msg Message) {
 }
 
 func (rf *Raft) doWithSnapshot(msg Message) {
-	if entry, err := rf.storage.entryAt(msg.PrevLogIdx); err == nil {
-		rf.storage.installSnapshot(entry.Term, entry.Index, msg.Data)
-	} else {
-		DPrintf("warning, not have such entry in storage of index: %v", msg.PrevLogIdx)
-	}
+	rf.storage.snapshot(msg.PrevLogIdx, msg.Data)
 	rf.sendMessage(Message{
 		Id:   msg.Id,
 		From: rf.me,
@@ -964,16 +960,10 @@ func (storage *Storage) commit(mayCommitIndex int, checkTerm bool) {
 	}
 
 	if entry, err := storage.entryAt(mayCommitIndex); err == nil {
-		if checkTerm {
-			if storage.term == entry.Term {
-				DPrintf("storage %v update commit index to %v", storage.me, storage.commitIndex)
-				storage.commitIndex = mayCommitIndex
-				storage.apply()
-			}
-		} else {
-			DPrintf("storage %v update commit index to %v", storage.me, storage.commitIndex)
+		if (checkTerm && storage.term == entry.Term) || (!checkTerm) {
 			storage.commitIndex = mayCommitIndex
-			storage.apply()
+			go storage.apply()
+			DPrintf("storage %v update commit index to %v", storage.me, storage.commitIndex)
 		}
 	} else {
 		DPrintf("error, storage %v didn't has a entry in index %v", storage.me, mayCommitIndex)
@@ -1059,13 +1049,36 @@ func (storage *Storage) installSnapshot(term int, index int, snapshot []byte) bo
 		firstIndex := storage.ents[0].Index
 		storage.ents = storage.ents[index+1-firstIndex:]
 	} else {
-		storage.ents = []LogEntry{}
+		storage.ents = nil
 	}
+	DPrintf("server %v install snapshot, storage: %v", storage.me, storage.String())
 	storage.rf.persist()
 	return true
 }
 
-func (storage *Storage) snapshot(term int, index int, data []byte) {
+func (storage *Storage) snapshot(index int, data []byte) {
+	if index <= storage.sn.LastIncludedIndex {
+		return
+	}
+	if entry, err := storage.entryAt(index); err == nil {
+		storage.sn.LastIncludedIndex = index
+		storage.sn.LastIncludedTerm = entry.Term
+		storage.sn.Data = data
+
+		_, lastIndex := storage.lastLogInfo()
+		_, firstIndex := storage.firstLogInfo()
+		if index+1 > lastIndex {
+			storage.ents = nil
+		} else {
+			storage.ents = storage.ents[index+1-firstIndex:]
+		}
+		storage.rf.persist()
+	} else {
+		DPrintf("error: server %v generator snapshot failed, entry not exists in %v", storage.me, index)
+	}
+}
+
+func (storage *Storage) applySnapshot(term int, index int, data []byte) {
 	storage.applyCh <- ApplyMsg{
 		SnapshotValid: true,
 		Snapshot:      data,
@@ -1091,8 +1104,6 @@ func (storage *Storage) String() string {
 /****      Storage End                ******/
 
 /****      Transport Start   ****/
-
-const MAX_RETRY_TIMES = 3
 
 type Transport struct {
 	rf *Raft
@@ -1197,10 +1208,7 @@ func (ts *Transport) remote(msg Message) {
 					Agreed:     reply.Success,
 				}
 			} else {
-				if msg.Retry < MAX_RETRY_TIMES {
-					msg.Retry++
-					ts.out <- msg
-				}
+				ts.out <- msg
 			}
 		}
 		break
