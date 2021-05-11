@@ -59,9 +59,3 @@ type LogEntry struct {
 	Term    int
 	Index   int
 }
-
-type Snapshot struct {
-	LastIncludedTerm  int
-	LastIncludedIndex int
-	Data              []byte
-}

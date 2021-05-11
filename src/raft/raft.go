@@ -113,7 +113,6 @@ type HardState struct {
 	CurrentTerm int
 	VoteFor     int
 	Logs        []LogEntry
-	LastApplied int
 }
 
 // return currentTerm and whether this server
@@ -150,7 +149,6 @@ func (rf *Raft) persist() {
 		CurrentTerm: rf.currentTerm,
 		VoteFor:     rf.voteFor,
 		Logs:        rf.storage.ents,
-		LastApplied: rf.storage.lastApplied,
 	}
 	e.Encode(hd)
 	data := w.Bytes()
@@ -186,8 +184,6 @@ func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 		rf.currentTerm = hd.CurrentTerm
 		rf.voteFor = hd.VoteFor
 		rf.storage.ents = hd.Logs
-
-		rf.storage.lastApplied = hd.LastApplied
 	}
 
 }
@@ -475,21 +471,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 	rf.transport = transport
 
-	snapshot := Snapshot{
-		LastIncludedTerm:  0,
-		LastIncludedIndex: 0,
-		Data:              nil,
-	}
-	storage := &Storage{
-		rf:          rf,
-		me:          rf.me,
-		sn:          snapshot,
-		term:        rf.currentTerm,
-		ents:        make([]LogEntry, 0),
-		lastApplied: 0,
-		commitIndex: 0,
-		applyCh:     applyCh,
-	}
+	storage := makeStorage(rf.me, func() {
+		rf.persist()
+	}, applyCh)
 	rf.storage = storage
 
 	rf.tickCh = make(chan interface{}, 32)
@@ -536,7 +520,8 @@ func (rf *Raft) tick() {
 
 func (rf *Raft) heartbeat() {
 	for server := 0; server < len(rf.peers); server++ {
-		if rf.nextIndex[server] <= rf.storage.sn.LastIncludedIndex {
+		firstLogEntry := rf.storage.firstLogEntry()
+		if rf.nextIndex[server] <= firstLogEntry.Index {
 			rf.sendInstallSnapshot(server)
 		} else {
 			rf.sendAppendEntries(server)
@@ -547,14 +532,14 @@ func (rf *Raft) heartbeat() {
 
 func (rf *Raft) sendAppendEntries(server int) {
 	if server != rf.me {
-		prevLogTerm, prevLogIndex, entries := rf.storage.fromEntries(rf.nextIndex[server])
+		prevLogEntry, entries := rf.storage.fromEntries(rf.nextIndex[server])
 		rf.sendMessage(Message{
 			MType:        MsgAppendRequest,
 			From:         rf.me,
 			To:           server,
 			Term:         rf.currentTerm,
-			PrevLogIdx:   prevLogIndex,
-			PrevLogTerm:  prevLogTerm,
+			PrevLogIdx:   prevLogEntry.Index,
+			PrevLogTerm:  prevLogEntry.Term,
 			Entries:      entries,
 			LeaderCommit: rf.storage.commitIndex,
 		})
@@ -563,14 +548,15 @@ func (rf *Raft) sendAppendEntries(server int) {
 
 func (rf *Raft) sendInstallSnapshot(server int) {
 	if server != rf.me {
+		firstLogEntry := rf.storage.firstLogEntry()
 		rf.sendMessage(Message{
 			MType:       MsgInstallSnapshotRequest,
 			From:        rf.me,
 			To:          server,
 			Term:        rf.currentTerm,
-			PrevLogIdx:  rf.storage.sn.LastIncludedIndex,
-			PrevLogTerm: rf.storage.sn.LastIncludedTerm,
-			Data:        rf.storage.sn.Data,
+			PrevLogIdx:  firstLogEntry.Index,
+			PrevLogTerm: firstLogEntry.Term,
+			Data:        rf.storage.sn,
 		})
 	}
 }
@@ -578,15 +564,13 @@ func (rf *Raft) sendInstallSnapshot(server int) {
 func (rf *Raft) becomeFollower(term int) {
 	rf.stepFunc = stepFollower
 
-	rf.restElecElapsed()
 	rf.state = Follower
-
 	if term > rf.currentTerm {
 		rf.voteFor = None
 	}
-
 	rf.currentTerm = term
-	rf.storage.term = term
+	rf.resetElecTimeout()
+
 	rf.persist()
 }
 
@@ -594,7 +578,6 @@ func (rf *Raft) becomeCandidate() {
 	rf.stepFunc = stepCandidate
 
 	rf.currentTerm++
-	rf.storage.term = rf.currentTerm
 	rf.voteFor = rf.me
 	rf.state = Candidate
 	rf.resetElecTimeout()
@@ -604,7 +587,7 @@ func (rf *Raft) becomeCandidate() {
 }
 
 func (rf *Raft) startElection() {
-	lastTerm, lastIndex := rf.storage.mostContainsInfo()
+	lastEntry := rf.storage.lastLogEntry()
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			rf.votes[i] = false
@@ -613,8 +596,8 @@ func (rf *Raft) startElection() {
 				From:        rf.me,
 				To:          i,
 				Term:        rf.currentTerm,
-				PrevLogIdx:  lastIndex,
-				PrevLogTerm: lastTerm,
+				PrevLogIdx:  lastEntry.Index,
+				PrevLogTerm: lastEntry.Term,
 			})
 		} else {
 			rf.votes[i] = true
@@ -623,17 +606,18 @@ func (rf *Raft) startElection() {
 }
 
 func (rf *Raft) becomeLeader() {
-	rf.state = Leader
 	rf.stepFunc = stepLeader
 
-	_, lastIndex := rf.storage.mostContainsInfo()
+	rf.state = Leader
+
+	lastEntry := rf.storage.lastLogEntry()
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
-			rf.matchIndex[i] = lastIndex
+			rf.matchIndex[i] = lastEntry.Index
 		} else {
 			rf.matchIndex[i] = 0
 		}
-		rf.nextIndex[i] = lastIndex + 1
+		rf.nextIndex[i] = lastEntry.Index + 1
 	}
 
 	rf.triggerHeartbeat(true)
@@ -649,15 +633,15 @@ func (rf *Raft) step(msg Message) {
 		switch msg.MType {
 		case MsgAppendCommand:
 			if rf.state == Leader {
-				DPrintf("leader %v append command: %v", rf.me, msg.Command)
-				term, index := rf.storage.appendCommand(msg.Command)
-				rf.matchIndex[rf.me] = index
+				newEntry := rf.storage.appendCommand(rf.currentTerm, msg.Command)
+				DPrintf("leader %v append command: {%v, %v, %v}", rf.me, msg.Command, newEntry.Term, newEntry.Index)
+				rf.matchIndex[rf.me] = newEntry.Index
 				rf.sendMessage(Message{
 					Id:          msg.Id,
 					From:        rf.me,
 					To:          None,
-					PrevLogIdx:  index,
-					PrevLogTerm: term,
+					PrevLogIdx:  newEntry.Index,
+					PrevLogTerm: newEntry.Term,
 				})
 				rf.triggerHeartbeat(false)
 			} else {
@@ -688,7 +672,8 @@ func (rf *Raft) step(msg Message) {
 		}
 
 		if msg.Term > rf.currentTerm ||
-			(msg.MType == MsgAppendRequest && rf.state == Candidate) {
+			(msg.MType == MsgAppendRequest && rf.state == Candidate) ||
+			(msg.MType == MsgInstallSnapshotRequest && rf.state == Candidate) {
 			rf.becomeFollower(msg.Term)
 		}
 
@@ -771,7 +756,7 @@ func stepFollower(rf *Raft, msg Message) {
 		if rf.storage.match(msg.PrevLogTerm, msg.PrevLogIdx) {
 			matchIndex := rf.storage.appendLogEntries(msg.PrevLogIdx, msg.Entries)
 			mayCommitIndex := Min(msg.LeaderCommit, matchIndex)
-			rf.storage.commit(mayCommitIndex, false)
+			rf.storage.commit(mayCommitIndex)
 			rf.sendMessage(Message{
 				MType:      MsgAppendResponse,
 				Id:         msg.Id,
@@ -786,13 +771,14 @@ func stepFollower(rf *Raft, msg Message) {
 		break
 
 	case MsgInstallSnapshotRequest:
+		rf.restElecElapsed()
+
 		rf.storage.applySnapshot(msg.PrevLogTerm, msg.PrevLogIdx, msg.Data)
 		rf.sendMessage(Message{
-			MType:  MsgInstallSnapshotResponse,
-			Id:     msg.Id,
-			From:   rf.me,
-			To:     msg.From,
-			Agreed: true,
+			MType: MsgInstallSnapshotResponse,
+			Id:    msg.Id,
+			From:  rf.me,
+			To:    msg.From,
 		})
 		break
 
@@ -837,17 +823,26 @@ func stepLeader(rf *Raft, msg Message) {
 				rf.nextIndex[msg.From] = msg.PrevLogIdx + 1
 
 				mayCommitIndex := Majority(rf.matchIndex)
-				rf.storage.commit(mayCommitIndex, true)
+				if mayCommitIndex > rf.storage.commitIndex {
+					if entry, err := rf.storage.entryAt(mayCommitIndex); err == nil && entry.Term == rf.currentTerm {
+						rf.storage.commit(mayCommitIndex)
+					}
+				}
 			}
 		} else {
 			rf.nextIndex[msg.From] = Max(rf.matchIndex[msg.From]+1, rf.nextIndex[msg.From]-1)
-			rf.sendAppendEntries(msg.From)
+			firstLogEntry := rf.storage.firstLogEntry()
+			if rf.nextIndex[msg.From] <= firstLogEntry.Index {
+				rf.sendInstallSnapshot(msg.From)
+			} else {
+				rf.sendAppendEntries(msg.From)
+			}
 		}
 		break
 	case MsgInstallSnapshotResponse:
-		if msg.Agreed && rf.matchIndex[msg.From] < rf.storage.sn.LastIncludedIndex {
-			rf.matchIndex[msg.From] = rf.storage.sn.LastIncludedIndex
-			rf.nextIndex[msg.From] = rf.matchIndex[msg.From] + 1
+		if rf.matchIndex[msg.From] < msg.PrevLogIdx {
+			rf.matchIndex[msg.From] = msg.PrevLogIdx
+			rf.nextIndex[msg.From] = msg.PrevLogIdx + 1
 		}
 		break
 	default:
@@ -865,7 +860,7 @@ func (rf *Raft) doWithSnapshot(msg Message) {
 }
 
 func (rf *Raft) doWithCondSnapshot(msg Message) {
-	ok := rf.storage.installSnapshot(msg.PrevLogTerm, msg.PrevLogIdx, msg.Data)
+	ok := rf.storage.updateSnapshot(msg.PrevLogTerm, msg.PrevLogIdx, msg.Data)
 	rf.sendMessage(Message{
 		Id:     msg.Id,
 		From:   rf.me,
@@ -877,106 +872,109 @@ func (rf *Raft) doWithCondSnapshot(msg Message) {
 /****      Storage Begin                ******/
 
 type Storage struct {
-	rf          *Raft
-	me          int
-	sn          Snapshot
-	term        int
+	me int
+
 	ents        []LogEntry
 	lastApplied int
 	commitIndex int
-	applyCh     chan ApplyMsg
+	sn          []byte
+
+	applyLock sync.Mutex
+	applyCh   chan ApplyMsg
+
+	persistFunc func()
 }
 
-func (storage *Storage) firstLogInfo() (int, int) {
-	if len(storage.ents) == 0 {
-		return -1, -1
-	} else {
-		return storage.ents[0].Term, storage.ents[0].Index
+func makeStorage(me int, persistFunc func(), applyCh chan ApplyMsg) *Storage {
+	storage := &Storage{
+		me:          me,
+		lastApplied: 0,
+		commitIndex: 0,
+		sn:          nil,
+		applyCh:     applyCh,
+		persistFunc: persistFunc,
 	}
+	// dummy entry
+	ents := []LogEntry{{
+		Command: nil,
+		Term:    0,
+		Index:   0,
+	}}
+	storage.ents = ents
+
+	return storage
 }
 
-func (storage *Storage) lastLogInfo() (int, int) {
-	if len(storage.ents) == 0 {
-		return -1, -1
-	} else {
-		return storage.ents[len(storage.ents)-1].Term, storage.ents[len(storage.ents)-1].Index
-	}
+// dummy entry,represent snapshot's LastIncludedIndex and LastIncludedTerm
+func (storage *Storage) firstLogEntry() LogEntry {
+	return storage.ents[0]
 }
 
-func (storage *Storage) mostContainsInfo() (int, int) {
-	if len(storage.ents) == 0 {
-		return storage.sn.LastIncludedTerm, storage.sn.LastIncludedIndex
-	} else {
-		return storage.ents[len(storage.ents)-1].Term, storage.ents[len(storage.ents)-1].Index
-	}
-}
-
-func (storage *Storage) fromEntries(index int) (int, int, []LogEntry) {
-	var prevLogTerm, prevLogIndex int
-	var entries []LogEntry
-	if _, err := storage.entryAt(index); err == nil {
-		if index == storage.ents[0].Index {
-			prevLogTerm, prevLogIndex = storage.sn.LastIncludedTerm, storage.sn.LastIncludedIndex
-		} else {
-			prevEntry, _ := storage.entryAt(index - 1)
-			prevLogTerm, prevLogIndex = prevEntry.Term, prevEntry.Index
-		}
-		entries = storage.ents[index-storage.ents[0].Index:]
-	} else {
-		prevLogTerm, prevLogIndex = storage.mostContainsInfo()
-		entries = nil
-	}
-	return prevLogTerm, prevLogIndex, entries
+func (storage *Storage) lastLogEntry() LogEntry {
+	return storage.ents[len(storage.ents)-1]
 }
 
 func (storage *Storage) entryAt(index int) (LogEntry, error) {
-	if len(storage.ents) == 0 || index < storage.ents[0].Index || index > storage.ents[len(storage.ents)-1].Index {
+	if index <= storage.ents[0].Index || index > storage.ents[len(storage.ents)-1].Index {
 		return LogEntry{}, NoSuchEntryError
 	} else {
 		logIndex := index - storage.ents[0].Index
+		if logIndex >= len(storage.ents) {
+			DPrintf("Panic")
+		}
 		return storage.ents[logIndex], nil
 	}
 }
 
+func (storage *Storage) fromEntries(startIndex int) (LogEntry, []LogEntry) {
+	var prevLogEntry LogEntry
+	var entries []LogEntry
+	firstLogIndex := storage.ents[0].Index
+	if startIndex > firstLogIndex {
+		if startIndex <= storage.ents[len(storage.ents)-1].Index {
+			prevLogEntry = storage.ents[startIndex-1-firstLogIndex]
+			entries = storage.ents[startIndex-firstLogIndex:]
+		} else if startIndex == storage.ents[len(storage.ents)-1].Index+1 {
+			prevLogEntry = storage.ents[len(storage.ents)-1]
+		} else {
+			DPrintf("Error, start index %v too large ", startIndex)
+		}
+	} else {
+		DPrintf("Error: start index %v too small", startIndex)
+	}
+	return prevLogEntry, entries
+}
+
 func (storage *Storage) isUpToDate(otherTerm int, otherIndex int) bool {
-	lastTerm, lastIndex := storage.mostContainsInfo()
-	return lastTerm > otherTerm || (lastTerm == otherTerm && lastIndex > otherIndex)
+	entry := storage.lastLogEntry()
+	return entry.Term > otherTerm || (entry.Term == otherTerm && entry.Index > otherIndex)
 }
 
 func (storage *Storage) match(otherTerm int, otherIndex int) bool {
-	if otherIndex == storage.sn.LastIncludedIndex {
-		return otherTerm == storage.sn.LastIncludedTerm
-	}
-	if entry, err := storage.entryAt(otherIndex); err != nil {
+	firstIndex := storage.ents[0].Index
+	if otherIndex < firstIndex || otherIndex > storage.ents[len(storage.ents)-1].Index {
 		return false
-	} else {
-		return entry.Term == otherTerm
 	}
+	return storage.ents[otherIndex-firstIndex].Term == otherTerm
 }
 
-func (storage *Storage) commit(mayCommitIndex int, checkTerm bool) {
+func (storage *Storage) commit(mayCommitIndex int) {
 	if mayCommitIndex <= storage.commitIndex {
 		return
 	}
-
-	if entry, err := storage.entryAt(mayCommitIndex); err == nil {
-		if (checkTerm && storage.term == entry.Term) || (!checkTerm) {
-			storage.commitIndex = mayCommitIndex
-			go storage.apply()
-			DPrintf("storage %v update commit index to %v", storage.me, storage.commitIndex)
-		}
-	} else {
-		DPrintf("error, storage %v didn't has a entry in index %v", storage.me, mayCommitIndex)
-	}
+	storage.commitIndex = mayCommitIndex
+	DPrintf("server %v update commit index to %v", storage.me, storage.commitIndex)
+	go storage.apply()
 }
 
 func (storage *Storage) apply() {
-	if storage.lastApplied < storage.commitIndex {
-		prevApplyIndex := storage.lastApplied
+	storage.applyLock.Lock()
+	defer storage.applyLock.Unlock()
 
-		for i := 0; i < len(storage.ents); i++ {
+	if storage.lastApplied < storage.commitIndex {
+		for i := 1; i < len(storage.ents); i++ {
 			index := storage.ents[i].Index
-			if index > prevApplyIndex && index <= storage.commitIndex {
+			if index > storage.lastApplied && index <= storage.commitIndex {
 				storage.applyCh <- ApplyMsg{
 					CommandValid: true,
 					Command:      storage.ents[i].Command,
@@ -985,120 +983,99 @@ func (storage *Storage) apply() {
 				storage.lastApplied = index
 			}
 		}
-		storage.rf.persist()
 	}
 }
 
-func (storage *Storage) appendCommand(command interface{}) (int, int) {
-	var entry LogEntry
-	if len(storage.ents) == 0 {
-		entry = LogEntry{
-			Command: command,
-			Term:    storage.term,
-			Index:   storage.sn.LastIncludedIndex + 1,
-		}
-	} else {
-		_, index := storage.lastLogInfo()
-		entry = LogEntry{
-			Command: command,
-			Term:    storage.term,
-			Index:   index + 1,
-		}
+func (storage *Storage) applySnapshot(prevTerm int, prevIndex int, snapshot []byte) {
+	storage.applyLock.Lock()
+	defer storage.applyLock.Unlock()
+
+	storage.applyCh <- ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      snapshot,
+		SnapshotTerm:  prevTerm,
+		SnapshotIndex: prevIndex,
+	}
+}
+
+func (storage *Storage) appendCommand(term int, command interface{}) LogEntry {
+	oldLastEntry := storage.lastLogEntry()
+	entry := LogEntry{
+		Command: command,
+		Term:    term,
+		Index:   oldLastEntry.Index + 1,
 	}
 	storage.ents = append(storage.ents, entry)
-	storage.rf.persist()
-	DPrintf("storage %v append command, after: %v", storage.me, storage.String())
-	return entry.Term, entry.Index
+	storage.persistFunc()
+	return entry
 }
 
 func (storage *Storage) appendLogEntries(matchIndex int, logs []LogEntry) int {
+	appendIndex := 0
+	keepIndex := matchIndex + 1 - storage.ents[0].Index
+	for appendIndex < len(logs) && keepIndex < len(storage.ents) {
+		if logs[appendIndex].Term != storage.ents[keepIndex].Term {
+			break
+		}
+		appendIndex++
+		keepIndex++
+	}
+	if appendIndex < len(logs) {
+		storage.ents = append(storage.ents[:keepIndex], logs[appendIndex:]...)
+		DPrintf("server %v update storage: %v", storage.me, storage.String())
+	}
+
+	storage.persistFunc()
 	if len(logs) == 0 {
 		return matchIndex
-	}
-
-	if len(storage.ents) == 0 {
-		storage.ents = logs
 	} else {
-		appendIndex := 0
-		keepIndex := matchIndex + 1 - storage.ents[0].Index
-		for appendIndex < len(logs) && keepIndex < len(storage.ents) {
-			if logs[appendIndex].Term != storage.ents[keepIndex].Term {
-				break
-			}
-			appendIndex++
-			keepIndex++
-		}
-		if appendIndex < len(logs) {
-			storage.ents = append(storage.ents[:keepIndex], logs[appendIndex:]...)
-		}
+		return logs[len(logs)-1].Index
 	}
-	DPrintf("storage %v append logs, after: %v", storage.me, storage.String())
-	storage.rf.persist()
-	return logs[len(logs)-1].Index
 }
 
-func (storage *Storage) installSnapshot(term int, index int, snapshot []byte) bool {
-	if index <= storage.sn.LastIncludedIndex {
+func (storage *Storage) updateSnapshot(prevTerm int, prevIndex int, snapshot []byte) bool {
+	if prevIndex <= storage.ents[0].Index {
 		return false
 	}
 
-	storage.sn.LastIncludedIndex = index
-	storage.sn.LastIncludedTerm = term
-	storage.sn.Data = snapshot
-	if _, err := storage.entryAt(index + 1); err == nil {
-		firstIndex := storage.ents[0].Index
-		storage.ents = storage.ents[index+1-firstIndex:]
+	keepIndex := prevIndex + 1
+	lastIndex := storage.ents[len(storage.ents)-1].Index
+	if keepIndex > lastIndex {
+		storage.ents = []LogEntry{{
+			Command: nil,
+			Index:   prevIndex,
+			Term:    prevTerm,
+		}}
 	} else {
-		storage.ents = nil
+		storage.ents = storage.ents[prevIndex-storage.ents[0].Index:]
+		storage.ents[0] = LogEntry{
+			Command: nil,
+			Term:    prevTerm,
+			Index:   prevIndex,
+		}
 	}
-	DPrintf("server %v install snapshot, storage: %v", storage.me, storage.String())
-	storage.rf.persist()
+	storage.sn = snapshot
+	storage.persistFunc()
 	return true
 }
 
-func (storage *Storage) snapshot(index int, data []byte) {
-	if index <= storage.sn.LastIncludedIndex {
+func (storage *Storage) snapshot(index int, snapshot []byte) {
+	if index <= storage.ents[0].Index {
 		return
 	}
 	if entry, err := storage.entryAt(index); err == nil {
-		storage.sn.LastIncludedIndex = index
-		storage.sn.LastIncludedTerm = entry.Term
-		storage.sn.Data = data
-
-		_, lastIndex := storage.lastLogInfo()
-		_, firstIndex := storage.firstLogInfo()
-		if index+1 > lastIndex {
-			storage.ents = nil
-		} else {
-			storage.ents = storage.ents[index+1-firstIndex:]
-		}
-		storage.rf.persist()
+		term := entry.Term
+		storage.updateSnapshot(term, index, snapshot)
 	} else {
-		DPrintf("error: server %v generator snapshot failed, entry not exists in %v", storage.me, index)
-	}
-}
-
-func (storage *Storage) applySnapshot(term int, index int, data []byte) {
-	storage.applyCh <- ApplyMsg{
-		SnapshotValid: true,
-		Snapshot:      data,
-		SnapshotTerm:  term,
-		SnapshotIndex: index,
+		DPrintf("Error: snapshot index %v not contains in storage: %v", index, storage.String())
 	}
 }
 
 func (storage *Storage) String() string {
 	l := len(storage.ents)
-	if l == 0 {
-		return fmt.Sprintf("{%v, %v, %v}", storage.commitIndex,
-			storage.sn.LastIncludedTerm, storage.sn.LastIncludedIndex)
-	} else {
-		return fmt.Sprintf("{%v, %v, %v, [(%v, %v), (%v, %v)]}", storage.commitIndex,
-			storage.sn.LastIncludedTerm, storage.sn.LastIncludedIndex,
-			storage.ents[0].Term, storage.ents[0].Index,
-			storage.ents[l-1].Term, storage.ents[l-1].Index)
-	}
-
+	return fmt.Sprintf("{%v, [(%v, %v), (%v, %v)]}", storage.commitIndex,
+		storage.ents[0].Term, storage.ents[0].Index,
+		storage.ents[l-1].Term, storage.ents[l-1].Index)
 }
 
 /****      Storage End                ******/
@@ -1155,7 +1132,17 @@ func (ts *Transport) run() {
 	}
 }
 
+func (ts *Transport) retry(msg Message) {
+	if !ts.stopped() {
+		ts.out <- msg
+	}
+}
+
 func (ts *Transport) remote(msg Message) {
+	if ts.stopped() {
+		return
+	}
+
 	if msg.Term < ts.rf.currentTerm {
 		// discard outdate msg
 		return
@@ -1181,7 +1168,7 @@ func (ts *Transport) remote(msg Message) {
 					Agreed: reply.VoteGranted,
 				}
 			} else {
-				ts.out <- msg
+				ts.retry(msg)
 			}
 		}
 		break
@@ -1208,7 +1195,7 @@ func (ts *Transport) remote(msg Message) {
 					Agreed:     reply.Success,
 				}
 			} else {
-				ts.out <- msg
+				ts.retry(msg)
 			}
 		}
 		break
@@ -1233,7 +1220,7 @@ func (ts *Transport) remote(msg Message) {
 					Term:       msg.Term,
 				}
 			} else {
-				ts.out <- msg
+				ts.retry(msg)
 			}
 		}
 		break
