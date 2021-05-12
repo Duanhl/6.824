@@ -1,6 +1,12 @@
 package mr
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"sync"
+	"time"
+)
 import "log"
 import "net/rpc"
 import "hash/fnv"
@@ -12,6 +18,14 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+type ByKey []KeyValue
+
+func (bk ByKey) Less(i, j int) bool { return bk[i].Key < bk[j].Key }
+
+func (bk ByKey) Swap(i, j int) { bk[i], bk[j] = bk[j], bk[i] }
+
+func (bk ByKey) Len() int { return len(bk) }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -34,6 +48,63 @@ func Worker(mapf func(string, string) []KeyValue,
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
 
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		stop := false
+		for !stop {
+			requireArgs := &RequireTaskArgs{}
+			requireReply := &RequireTaskReply{}
+
+			if call("Coordinator.RequireTask", &requireArgs, &requireReply) {
+				switch requireReply.Type {
+				case Mapper:
+					Dprintf("worker get map task from master: %s", requireReply.Filename)
+					kvs := mapf(requireReply.Filename, requireReply.Content)
+
+					commitArgs := &CommitTaskArgs{
+						Type:  Mapper,
+						Index: requireReply.Index,
+						KVS:   kvs,
+					}
+					commitReply := &CommitTaskReply{}
+					if !call("Coordinator.CommitTask", &commitArgs, &commitReply) {
+						stop = true
+					}
+					break
+				case Reducer:
+					Dprintf("worker get reduce task from master: %v", requireReply.Index)
+					oname := "mr-out-" + strconv.Itoa(requireReply.Index)
+					ofile, _ := os.Create(oname)
+
+					for _, kvl := range requireReply.KVL {
+						output := reducef(kvl.Key, kvl.Values)
+						fmt.Fprintf(ofile, "%v %v\n", kvl.Key, output)
+					}
+
+					ofile.Close()
+
+					commitArgs := &CommitTaskArgs{
+						Type:  Reducer,
+						Index: requireReply.Index,
+					}
+					commitReply := &CommitTaskReply{}
+					if !call("Coordinator.CommitTask", &commitArgs, &commitReply) {
+						stop = true
+					}
+					break
+				case None:
+					time.Sleep(50 * time.Millisecond)
+					break
+				}
+			} else {
+				stop = true
+			}
+		}
+		wg.Done()
+	}()
+
+	wg.Wait()
 }
 
 //

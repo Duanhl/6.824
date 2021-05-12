@@ -6,7 +6,11 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
+import (
+	"errors"
+	"log"
+	"os"
+)
 import "strconv"
 
 //
@@ -14,12 +18,66 @@ import "strconv"
 // and reply for an RPC.
 //
 
+const enableDebugger = false
+
+func Dprintf(fmt string, v ...interface{}) {
+	if enableDebugger {
+		log.Printf(fmt, v...)
+	}
+}
+
+var MasterStopError = errors.New("master stopped")
+
+type KVList struct {
+	Key    string
+	Values []string
+}
+
 type ExampleArgs struct {
 	X int
 }
 
 type ExampleReply struct {
 	Y int
+}
+
+type TaskType uint8
+
+func (tt TaskType) String() string {
+	if tt == Mapper {
+		return "map"
+	} else if tt == Reducer {
+		return "reduce"
+	} else {
+		return ""
+	}
+}
+
+const (
+	Mapper TaskType = iota
+	Reducer
+	None
+)
+
+type RequireTaskArgs struct {
+}
+
+type RequireTaskReply struct {
+	Type     TaskType
+	Index    int
+	Filename string
+	Content  string
+	KVL      []KVList
+}
+
+type CommitTaskArgs struct {
+	Type  TaskType
+	Index int
+	KVS   []KeyValue
+}
+
+type CommitTaskReply struct {
+	Ok bool
 }
 
 // Add your RPC definitions here.
