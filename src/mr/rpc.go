@@ -63,17 +63,16 @@ type RequireTaskArgs struct {
 }
 
 type RequireTaskReply struct {
-	Type     TaskType
-	Index    int
-	Filename string
-	Content  string
-	KVL      []KVList
+	Type    TaskType
+	Index   int
+	Files   []string
+	NReduce int
 }
 
 type CommitTaskArgs struct {
 	Type  TaskType
 	Index int
-	KVS   []KeyValue
+	Files []string
 }
 
 type CommitTaskReply struct {

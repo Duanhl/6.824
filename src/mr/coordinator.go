@@ -1,9 +1,7 @@
 package mr
 
 import (
-	"io/ioutil"
 	"log"
-	"sort"
 	"sync"
 	"time"
 )
@@ -41,15 +39,13 @@ const (
 type ReduceProgress struct {
 	state     ProgressState
 	startTime time.Time
-	kv        []KVList
+	files     []string
 }
 
 type MapProgress struct {
 	state     ProgressState
 	startTime time.Time
 	file      string
-	content   string
-	kv        []KeyValue
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -75,9 +71,9 @@ func (c *Coordinator) RequireTask(args *RequireTaskArgs, reply *RequireTaskReply
 			c.maps[index].startTime = time.Now()
 
 			reply.Type = Mapper
-			reply.Filename = c.maps[index].file
-			reply.Content = c.maps[index].content
+			reply.Files = []string{c.maps[index].file}
 			reply.Index = index
+			reply.NReduce = len(c.reduces)
 		} else {
 			reply.Type = None
 		}
@@ -88,7 +84,7 @@ func (c *Coordinator) RequireTask(args *RequireTaskArgs, reply *RequireTaskReply
 			c.reduces[index].startTime = time.Now()
 
 			reply.Type = Reducer
-			reply.KVL = c.reduces[index].kv
+			reply.Files = c.reduces[index].files
 			reply.Index = index
 		} else {
 			reply.Type = None
@@ -130,11 +126,15 @@ func (c *Coordinator) CommitTask(args *CommitTaskArgs, reply *CommitTaskReply) e
 		Dprintf("submit map task: %v", c.maps[args.Index].file)
 		if c.state == MapPhase && c.maps[args.Index].state == Processing {
 			c.maps[args.Index].state = Done
-			c.maps[args.Index].kv = args.KVS
+			for i, f := range args.Files {
+				c.reduces[i].files = append(c.reduces[i].files, f)
+			}
 
 			if c.checkMapProgress() {
 				c.becomeReducePhase()
 			}
+		} else {
+			clearFiles(args.Files)
 		}
 		reply.Ok = true
 		break
@@ -167,30 +167,6 @@ func (c *Coordinator) checkMapProgress() bool {
 }
 
 func (c *Coordinator) becomeReducePhase() {
-
-	intermediateKV := []KeyValue{}
-	for _, p := range c.maps {
-		intermediateKV = append(intermediateKV, p.kv...)
-	}
-	sort.Sort(ByKey(intermediateKV))
-
-	i := 0
-	for i < len(intermediateKV) {
-		j := i + 1
-		for j < len(intermediateKV) && intermediateKV[i].Key == intermediateKV[j].Key {
-			j++
-		}
-		KVL := KVList{
-			Key:    intermediateKV[i].Key,
-			Values: []string{},
-		}
-		for k := i; k < j; k++ {
-			KVL.Values = append(KVL.Values, intermediateKV[k].Value)
-		}
-		n := ihash(KVL.Key) % len(c.reduces)
-		c.reduces[n].kv = append(c.reduces[n].kv, KVL)
-		i = j
-	}
 	c.state = ReducePhase
 	Dprintf("master change to reduce phase...")
 }
@@ -206,7 +182,17 @@ func (c *Coordinator) checkReduceProgress() bool {
 
 func (c *Coordinator) doneJob() {
 	c.state = Stop
+	for _, p := range c.reduces {
+		clearFiles(p.files)
+	}
+
 	Dprintf("master stop...")
+}
+
+func clearFiles(fs []string) {
+	for _, f := range fs {
+		os.Remove(f)
+	}
 }
 
 //
@@ -251,22 +237,10 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	// Your code here.
 	c.maps = make([]MapProgress, len(files))
 	for i := range c.maps {
-		f, err := os.Open(files[i])
-		if err != nil {
-			log.Fatalf("cannot open %v", files[i])
-		}
-		content, err := ioutil.ReadAll(f)
-		if err != nil {
-			log.Fatalf("cannot read %v", files[i])
-		}
-		f.Close()
-
 		c.maps[i] = MapProgress{
 			state:     Waiting,
 			startTime: time.Now(),
 			file:      files[i],
-			content:   string(content),
-			kv:        []KeyValue{},
 		}
 	}
 
@@ -275,11 +249,16 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		c.reduces[i] = ReduceProgress{
 			state:     Waiting,
 			startTime: time.Now(),
-			kv:        []KVList{},
+			files:     []string{},
 		}
 	}
 	c.state = MapPhase
 	Dprintf("master start server... nreduces: %v", nReduce)
+
+	err := os.Mkdir("/home/work/logs/mr", 0777)
+	if os.IsExist(err) {
+		Dprintf("warning: mr tmp dir already exists")
+	}
 
 	c.server()
 	return &c
