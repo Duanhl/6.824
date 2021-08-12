@@ -57,6 +57,5 @@ type Serializer struct {
 }
 
 func (s *Serializer) NextId() int64 {
-	atomic.AddInt64(&s.base, 1)
-	return atomic.LoadInt64(&s.base)
+	return atomic.AddInt64(&s.base, 1)
 }
