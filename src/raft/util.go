@@ -3,10 +3,11 @@ package raft
 import (
 	"log"
 	"sort"
+	"sync/atomic"
 )
 
 // Debugging
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -45,4 +46,17 @@ func Count(arr []bool) int {
 		}
 	}
 	return count
+}
+
+type IDGenerator interface {
+	NextId() int64
+}
+
+type Serializer struct {
+	base int64
+}
+
+func (s *Serializer) NextId() int64 {
+	atomic.AddInt64(&s.base, 1)
+	return atomic.LoadInt64(&s.base)
 }

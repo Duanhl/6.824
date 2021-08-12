@@ -14,6 +14,7 @@ const (
 	MsgCondInstallSnapshot
 
 	MsgAppendCommand
+	MsgGetState
 )
 
 type Message struct {
@@ -31,7 +32,7 @@ type Message struct {
 
 	Agreed bool
 
-	Retry int
+	IsLeader bool
 }
 
 type MessageSorter []Message
