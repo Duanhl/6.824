@@ -24,6 +24,7 @@ import (
 	"errors"
 	"net"
 	"strconv"
+	"time"
 )
 import "net/rpc"
 import "log"
@@ -35,7 +36,7 @@ import "sync/atomic"
 import "fmt"
 import "math/rand"
 
-// px.Status() return values, indicating
+// Fate px.Status() return values, indicating
 // whether an agreement has been decided,
 // or Paxos has not yet reached agreement,
 // or it was agreed but forgotten (i.e. < Min()).
@@ -47,16 +48,41 @@ const (
 	Forgotten      // decided but forgotten.
 )
 
+type Phase int
+
+const (
+	Prepare Phase = iota + 1
+	Accept
+)
+
 const None = -1
+const DefaultTimeout = 200 * time.Millisecond
 
 type Instance struct {
 	Seq  int
 	Fate Fate
 	Val  interface{}
 
+	// for acceptor
 	MinPid      Pid
 	AcceptedPid Pid
 	AcceptedVal interface{}
+
+	// for proposer
+	Choose Pid
+	Qp     map[int]Propose
+	Qa     map[int]bool
+}
+
+type Propose struct {
+	AcceptedPid Pid
+	AcceptedVal interface{}
+}
+
+type Timeout struct {
+	Seq   int
+	Pid   Pid
+	Phase Phase
 }
 
 type Paxos struct {
@@ -71,12 +97,16 @@ type Paxos struct {
 	// Your data here.
 	ins []Instance
 
-	seq Sequence
-	ser Serializer
+	quorum int
+	keep   []int // for Done(), Min()
 
-	recv chan Message
-	outc chan Message
-	rpcm map[uint64]Context
+	seq *Sequence
+	ser *Serializer
+
+	recv  chan Message
+	outc  chan Message
+	rpcm  map[uint64]Context
+	timec chan Timeout
 }
 
 //
@@ -115,7 +145,7 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 	return false
 }
 
-//
+// Start
 // the application wants paxos to start agreement on
 // instance seq, with proposed value v.
 // Start() returns right away; the application will
@@ -133,7 +163,7 @@ func (px *Paxos) Start(seq int, v interface{}) {
 	ctx.Done()
 }
 
-//
+// Done
 // the application on this machine is done with
 // all instances <= seq.
 //
@@ -149,17 +179,22 @@ func (px *Paxos) Done(seq int) {
 	ctx.Done()
 }
 
-//
+// Max
 // the application wants to know the
 // highest instance sequence known to
 // this peer.
 //
 func (px *Paxos) Max() int {
 	// Your code here.
-	return 0
+	ctx := px.register(Message{
+		Type: MaxQuery,
+		From: None,
+	})
+	msg := ctx.Done()
+	return msg.Seq
 }
 
-//
+// Min
 // Min() should return one more than the minimum among z_i,
 // where z_i is the highest number ever passed
 // to Done() on peer i. A peers z_i is -1 if it has
@@ -189,10 +224,15 @@ func (px *Paxos) Max() int {
 //
 func (px *Paxos) Min() int {
 	// You code here.
-	return 0
+	ctx := px.register(Message{
+		Type: MinQuery,
+		From: None,
+	})
+	msg := ctx.Done()
+	return msg.Seq
 }
 
-//
+// Status
 // the application wants to know whether this
 // peer thinks an instance has been decided,
 // and if so what the agreed value is. Status()
@@ -201,18 +241,54 @@ func (px *Paxos) Min() int {
 //
 func (px *Paxos) Status(seq int) (Fate, interface{}) {
 	// Your code here.
-	return Pending, nil
+	ctx := px.register(Message{
+		Type: Status,
+		From: None,
+		Seq:  seq,
+	})
+	msg := ctx.Done()
+	return Fate(msg.Fate), msg.Val
 }
 
 func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
+	ctx := px.register(Message{
+		Type: PrepareReq,
+		Seq:  args.Seq,
+		Pid:  args.Pid,
+	})
+	msg := ctx.Done()
+
+	reply.Agree = msg.Agree
+	reply.AcceptedVal = msg.Val
+	reply.AcceptedPid = msg.Pid
+
 	return nil
 }
 
 func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
+	ctx := px.register(Message{
+		Type: AcceptReq,
+		Seq:  args.Seq,
+		Pid:  args.Pid,
+		Val:  args.Val,
+	})
+	msg := ctx.Done()
+
+	reply.Agree = msg.Agree
+
 	return nil
 }
 
-//
+func (px *Paxos) DoneBroadcast(args *DoneBroadcastArgs, reply *DoneBroadcastReply) error {
+	ctx := px.register(Message{
+		Type: DoneBroadcast,
+		From: args.From,
+		Seq:  args.Seq,
+	})
+	ctx.Done()
+}
+
+// Kill
 // tell the peer to shut itself down.
 // for testing.
 // please do not change these two functions.
@@ -244,7 +320,7 @@ func (px *Paxos) isunreliable() bool {
 	return atomic.LoadInt32(&px.unreliable) != 0
 }
 
-//
+// Make
 // the application wants to create a paxos peer.
 // the ports of all the paxos peers (including this one)
 // are in peers[]. this servers port is peers[me].
@@ -255,6 +331,23 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 	px.me = me
 
 	// Your initialization code here.
+	px.ins = []Instance{}
+
+	px.quorum = len(peers)/2 + 1
+	px.keep = make([]int, len(peers))
+
+	px.seq = &Sequence{
+		Server: me,
+	}
+	px.ser = &Serializer{}
+
+	px.recv = make(chan Message, 128)
+	px.outc = make(chan Message, 128)
+	px.rpcm = map[uint64]Context{}
+	px.timec = make(chan Timeout)
+
+	go px.run()
+	go px.out()
 
 	if rpcs != nil {
 		// caller will create socket &c
@@ -314,9 +407,61 @@ func (px *Paxos) run() {
 	for px.isdead() == false {
 		select {
 		case msg := <-px.recv:
-			switch msg.Type {
-			// process msg
+			if msg.From == px.me && msg.To != px.me {
+				if ins, err := px.instanceAt(msg.Seq); err == nil {
+					// for prepare retry
+					if msg.Type == PrepareReq && msg.Pid.Equals(ins.Choose) && len(ins.Qp) < px.quorum {
+						px.sendMessage(msg)
+					}
+
+					// for accept retry
+					if msg.Type == AcceptReq && msg.Pid.Equals(ins.Choose) && len(ins.Qa) < px.quorum {
+						px.sendMessage(msg)
+					}
+				}
+			} else {
+				switch msg.Type {
+				// process msg
+				case StartProposer:
+					px.handleStart(msg)
+					break
+				case Status:
+					px.handleStatus(msg)
+					break
+				case DoneSnap:
+					px.handleDoneSnap(msg)
+					break
+				case MinQuery:
+					px.handleMinQuery(msg)
+					break
+				case MaxQuery:
+					px.handleMaxQuery(msg)
+					break
+
+				case AcceptReq:
+					px.handleAccept(msg)
+					break
+				case AcceptRes:
+					px.handleAcceptRes(msg)
+					break
+				case PrepareReq:
+					px.handlePrepare(msg)
+					break
+				case PrepareRes:
+					px.handlePrepareRes(msg)
+					break
+
+				case DoneBroadcast:
+					px.handleDoneBroadcast(msg)
+
+				default:
+					DPrintf("unsupported msg type: %s", msg.Type)
+				}
+
 			}
+
+		case t := <-px.timec:
+			px.handleTimeout(t)
 		}
 	}
 }
@@ -325,15 +470,88 @@ func (px *Paxos) out() {
 	for px.isdead() == false {
 		select {
 		case msg := <-px.outc:
-			switch msg.Type {
-			// send msg
+			if msg.From == px.me && msg.To == px.me { // me send to myself
+				px.recv <- msg
+			} else if msg.To == None || // response client function call
+				msg.Type == PrepareRes || msg.Type == AcceptRes { // for rpc call response
+				px.mu.Lock()
+
+				if ctx, ok := px.rpcm[msg.Id]; ok {
+					ctx.resc <- msg
+					delete(px.rpcm, msg.Id)
+				} else {
+					DPrintf("Error, ctx already be response, msg: %s", msg)
+				}
+
+				px.mu.Unlock()
+
+			} else { // for rpc call to other peer
+				go px.remote(msg)
 			}
 		}
 	}
 }
 
 func (px *Paxos) sendMessage(msg Message) {
+	if px.isdead() == false {
+		px.outc <- msg
+	}
+}
 
+func (px *Paxos) remote(msg Message) {
+	switch msg.Type {
+	case PrepareReq:
+		args := &PrepareArgs{
+			Seq: msg.Seq,
+			Pid: msg.Pid,
+		}
+		reply := &PrepareReply{}
+		if call(px.peers[msg.To], "Paxos.Prepare", args, reply) {
+			px.recv <- Message{
+				Type:        PrepareRes,
+				From:        msg.To,
+				To:          px.me,
+				Seq:         args.Seq,
+				Pid:         args.Pid,
+				Agree:       reply.Agree,
+				AcceptedPid: reply.AcceptedPid,
+				Val:         reply.AcceptedVal,
+			}
+
+		} else {
+			px.recv <- msg // for retry
+		}
+
+	case AcceptReq:
+		args := &AcceptArgs{
+			Seq: msg.Seq,
+			Pid: msg.Pid,
+			Val: msg.Val,
+		}
+
+		reply := &AcceptReply{}
+		if call(px.peers[msg.To], "Paxos.Accept", args, reply) {
+			px.recv <- Message{
+				Type:  PrepareRes,
+				From:  msg.To,
+				To:    px.me,
+				Seq:   msg.Seq,
+				Pid:   msg.Pid,
+				Agree: reply.Agree,
+			}
+
+		} else {
+			px.recv <- msg // for retry
+		}
+
+	case DoneBroadcast:
+		args := &DoneBroadcastArgs{
+			From: msg.From,
+			Seq:  msg.Seq,
+		}
+		reply := &DoneBroadcastReply{}
+		call(px.peers[msg.To], "Paxos.DoneBroadcast", args, reply)
+	}
 }
 
 func (px *Paxos) register(msg Message) Context {
@@ -351,6 +569,158 @@ func (px *Paxos) register(msg Message) Context {
 	return ctx
 }
 
+func (px *Paxos) handleStart(msg Message) {
+	if ins, err := px.instanceAt(msg.Seq); err == nil {
+		pid := px.seq.Next()
+
+		ins.Choose = pid
+		ins.Qp = map[int]Propose{}
+		ins.Qa = map[int]bool{}
+
+		px.updateInstance(ins)
+
+		px.startPrepare(msg.Seq, pid)
+	} else {
+		px.sendMessage(Message{
+			Id: msg.Id,
+			To: None,
+		})
+	}
+}
+
+func (px *Paxos) handleStatus(msg Message) {
+	if ins, err := px.instanceAt(msg.Seq); err == nil {
+		var val interface{}
+		if ins.Fate == Decided {
+			val = ins.Val
+		}
+		px.sendMessage(Message{
+			Type: Status,
+			Id:   msg.Id,
+			To:   None,
+			Fate: int(ins.Fate),
+			Val:  val,
+		})
+	} else {
+		px.sendMessage(Message{
+			Type: Status,
+			Id:   msg.Id,
+			To:   None,
+			Fate: int(Forgotten),
+			Val:  nil,
+		})
+	}
+}
+
+func (px *Paxos) handleDoneSnap(msg Message) {
+	firstSeq := px.ins[0].Seq
+	if msg.Seq >= firstSeq {
+		px.ins = px.ins[firstSeq-msg.Seq+1:]
+	}
+	px.keep[px.me] = msg.Seq
+	for i := 0; i < len(px.peers); i++ {
+		if i != px.me {
+			px.outc <- Message{
+				Type: DoneBroadcast,
+				From: px.me,
+				To:   i,
+				Seq:  msg.Seq,
+			}
+		}
+	}
+	px.sendMessage(Message{
+		Type: DoneSnap,
+		Id:   msg.Id,
+		To:   None,
+	})
+}
+
+func (px *Paxos) handleMinQuery(msg Message) {
+
+}
+
+func (px *Paxos) handleMaxQuery(msg Message) {
+	lastSeq := px.ins[len(px.ins)-1].Seq
+	px.sendMessage(Message{
+		Type: MaxQuery,
+		Id:   msg.Id,
+		To:   None,
+		Seq:  lastSeq,
+	})
+}
+
+// for proposer process timeout
+func (px *Paxos) handleTimeout(t Timeout) {
+	if ins, err := px.instanceAt(t.Seq); err == nil {
+		if t.Pid.Equals(ins.Choose) {
+			// when prepare timeout but haven't received enough agree prepare
+			if t.Phase == Prepare && len(ins.Qp) < px.quorum {
+				pid := px.seq.Next()
+				ins.Choose = pid
+				ins.Qp = map[int]Propose{}
+				px.updateInstance(ins)
+
+				px.startPrepare(t.Seq, pid)
+			}
+
+			if t.Phase == Accept && len(ins.Qa) < px.quorum {
+				pid := px.seq.Next()
+				ins.Choose = pid
+				ins.Qp = map[int]Propose{}
+				ins.Qa = map[int]bool{}
+
+				px.updateInstance(ins)
+				px.startAccept(t.Seq, pid, ins.Val)
+			}
+		}
+	}
+}
+
+func (px *Paxos) startPrepare(seq int, pid Pid) {
+	for i := 0; i < len(px.peers); i++ {
+		px.outc <- Message{
+			Type: PrepareReq,
+			From: px.me,
+			To:   i,
+			Seq:  seq,
+			Pid:  pid,
+		}
+	}
+
+	// set timeout
+	t := Timeout{
+		Seq:   seq,
+		Pid:   pid,
+		Phase: Prepare,
+	}
+	time.AfterFunc(DefaultTimeout, func() {
+		px.timec <- t
+	})
+}
+
+func (px *Paxos) startAccept(seq int, pid Pid, val interface{}) {
+	for i := 0; i < len(px.peers); i++ {
+		px.outc <- Message{
+			Type: AcceptReq,
+			From: px.me,
+			To:   i,
+			Seq:  seq,
+			Pid:  pid,
+			Val:  val,
+		}
+	}
+
+	// set timeout
+	t := Timeout{
+		Seq:   seq,
+		Pid:   pid,
+		Phase: Accept,
+	}
+	time.AfterFunc(DefaultTimeout, func() {
+		px.timec <- t
+	})
+}
+
 func (px *Paxos) handlePrepare(msg Message) {
 	if ins, err := px.instanceAt(msg.Seq); err == nil {
 		if msg.Pid.After(ins.MinPid) {
@@ -362,9 +732,8 @@ func (px *Paxos) handlePrepare(msg Message) {
 				Id:    msg.Id,
 				From:  px.me,
 				To:    msg.From,
-				Seq:   msg.Seq,
-				Pid:   ins.AcceptedPid,
 				Agree: true,
+				Pid:   ins.AcceptedPid,
 				Val:   ins.AcceptedVal,
 			})
 		} else {
@@ -373,11 +742,44 @@ func (px *Paxos) handlePrepare(msg Message) {
 				Id:    msg.Id,
 				From:  px.me,
 				To:    msg.From,
-				Seq:   msg.Seq,
-				Pid:   ins.AcceptedPid,
 				Agree: false,
+				Pid:   ins.AcceptedPid,
 				Val:   nil,
 			})
+		}
+	}
+}
+
+func (px *Paxos) handlePrepareRes(msg Message) {
+	if ins, err := px.instanceAt(msg.Seq); err == nil {
+		if ins.Choose.Equals(msg.Pid) { //with same round
+			if msg.Agree {
+				ins.Qp[msg.From] = Propose{
+					AcceptedPid: msg.Pid,
+					AcceptedVal: msg.Val,
+				}
+
+				if len(ins.Qp) == px.quorum {
+					maxPid := Pid{
+						Pre: -1,
+						Suf: 0,
+					}
+					var v interface{}
+					for _, p := range ins.Qp {
+						if maxPid.Before(p.AcceptedPid) {
+							maxPid = p.AcceptedPid
+							v = p.AcceptedVal
+						}
+					}
+
+					if v != nil {
+						ins.Val = v
+					}
+
+					px.startAccept(ins.Seq, ins.Choose, ins.Val)
+				}
+				px.updateInstance(ins)
+			}
 		}
 	}
 }
@@ -415,14 +817,50 @@ func (px *Paxos) handleAccept(msg Message) {
 	}
 }
 
+func (px *Paxos) handleAcceptRes(msg Message) {
+	if ins, err := px.instanceAt(msg.Seq); err == nil {
+		if ins.Choose.Equals(msg.Pid) { // with same round
+			if msg.Agree {
+				ins.Qa[msg.From] = true
+
+				// choose a value
+				if len(ins.Qa) == px.quorum {
+					ins.Fate = Decided
+				}
+
+				px.updateInstance(ins)
+			}
+		}
+	}
+}
+
+func (px *Paxos) handleDoneBroadcast(msg Message) {
+	if px.keep[msg.From] < msg.Seq {
+		px.keep[msg.From] = msg.Seq
+	}
+	px.sendMessage(Message{})
+}
+
+// found instance at seq, if seq smaller than first seq, return error
+// if seq bigger than last seq, create instance and full it util seq
 func (px *Paxos) instanceAt(seq int) (Instance, error) {
 	var instance Instance
-	if seq < px.ins[0].Seq || seq > px.ins[len(px.ins)].Seq {
+	if seq < px.ins[0].Seq {
 		return instance, errors.New("out of index:" + strconv.Itoa(seq))
+	}
+	lastSeq := px.ins[len(px.ins)-1].Seq
+	if seq > lastSeq {
+		for i := lastSeq + 1; i <= seq; i++ {
+			px.ins = append(px.ins, Instance{
+				Seq:  i,
+				Fate: Pending,
+			})
+		}
 	}
 	return px.ins[seq-px.ins[0].Seq], nil
 }
 
+// call after instanceAt, always in instances
 func (px *Paxos) updateInstance(ins Instance) {
-
+	px.ins[ins.Seq-px.ins[0].Seq] = ins
 }

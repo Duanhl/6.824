@@ -1,6 +1,20 @@
 package paxos
 
-import "sync/atomic"
+import (
+	"fmt"
+	"log"
+	"strconv"
+	"sync/atomic"
+)
+
+const Debug = false
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug {
+		log.Printf(format, a...)
+	}
+	return
+}
 
 type PrepareArgs struct {
 	Seq int
@@ -8,7 +22,7 @@ type PrepareArgs struct {
 }
 
 type PrepareReply struct {
-	Seq         int
+	Agree       bool
 	AcceptedVal interface{}
 	AcceptedPid Pid
 }
@@ -20,10 +34,22 @@ type AcceptArgs struct {
 }
 
 type AcceptReply struct {
-	Pid Pid
+	Agree bool
+}
+
+type DoneBroadcastArgs struct {
+	From int
+	Seq  int
+}
+
+type DoneBroadcastReply struct {
 }
 
 type MsgType int
+
+func (t MsgType) String() string {
+	return MsgTypeName[t]
+}
 
 const (
 	PrepareReq MsgType = iota + 1
@@ -37,7 +63,22 @@ const (
 	DoneSnap
 	MaxQuery
 	MinQuery
+
+	DoneBroadcast
 )
+
+var MsgTypeName = map[MsgType]string{
+	PrepareReq:    "PrepareReq",
+	PrepareRes:    "PrepareRes",
+	AcceptReq:     "AcceptReq",
+	AcceptRes:     "AcceptRes",
+	StartProposer: "StartProposer",
+	Status:        "Status",
+	DoneSnap:      "DoneSnap",
+	MaxQuery:      "MaxQuery",
+	MinQuery:      "MinQuery",
+	DoneBroadcast: "DoneBroadcast",
+}
 
 type Message struct {
 	Type MsgType
@@ -45,11 +86,27 @@ type Message struct {
 	From int
 	To   int
 
-	Seq int
-	Pid Pid
+	Seq  int
+	Pid  Pid
+	Fate int
 
-	Agree bool
-	Val   interface{}
+	Agree       bool
+	AcceptedPid Pid
+	Val         interface{}
+}
+
+func (m *Message) String() string {
+	return "{Type: " + m.Type.String() + ", " +
+		"Id: " + strconv.Itoa(int(m.Id)) + ", " +
+		"From: " + strconv.Itoa(m.From) + ", " +
+		"To: " + strconv.Itoa(m.To) + ", " +
+		"Seq: " + strconv.Itoa(m.Seq) + ", " +
+		"Pid: " + m.Pid.String() + ", " +
+		"Fate: " + strconv.Itoa(m.Fate) + ", " +
+		"Agree: " + strconv.FormatBool(m.Agree) + ", " +
+		"AcceptedPid: " + m.AcceptedPid.String() + ", " +
+		"Val: " + fmt.Sprintf("%v", m.Val) + "}"
+
 }
 
 type Context struct {
@@ -64,6 +121,10 @@ func (ctx *Context) Done() Message {
 type Pid struct {
 	Pre int
 	Suf uint64
+}
+
+func (p *Pid) String() string {
+	return strconv.Itoa(p.Pre) + "_" + strconv.Itoa(int(p.Suf))
 }
 
 func (s *Pid) Before(other Pid) bool {
