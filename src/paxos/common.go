@@ -3,11 +3,12 @@ package paxos
 import (
 	"fmt"
 	"log"
+	"math"
 	"strconv"
-	"sync/atomic"
 )
 
 const Debug = false
+const Warn = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -16,15 +17,38 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+func DWarn(format string, a ...interface{}) (n int, err error) {
+	if Warn {
+		log.Printf(format, a...)
+	}
+	return
+}
+
 type PrepareArgs struct {
 	Seq int
 	Pid Pid
+
+	Done     int
+	Proposer int
 }
 
 type PrepareReply struct {
 	Agree       bool
 	AcceptedVal interface{}
 	AcceptedPid Pid
+
+	Seq int
+	Pid Pid
+}
+
+func (pr *PrepareReply) String() string {
+	return "{" +
+		"Agree:" + strconv.FormatBool(pr.Agree) + "," +
+		"AcceptedVal:" + fmt.Sprintf("%v", pr.AcceptedVal) + "," +
+		"AcceptedPid:" + pr.AcceptedPid.String() + "," +
+		"Seq:" + strconv.Itoa(pr.Seq) + "," +
+		"Pid:" + pr.Pid.String() + "," +
+		"}"
 }
 
 type AcceptArgs struct {
@@ -34,15 +58,28 @@ type AcceptArgs struct {
 }
 
 type AcceptReply struct {
-	Agree bool
+	Agree       bool
+	AcceptedPid Pid
+
+	Seq int
+	Pid Pid
 }
 
-type DoneBroadcastArgs struct {
-	From int
-	Seq  int
+func (ar *AcceptReply) String() string {
+	return "{" +
+		"Agree:" + strconv.FormatBool(ar.Agree) + "," +
+		"AcceptedPid:" + ar.AcceptedPid.String() + "," +
+		"Seq:" + strconv.Itoa(ar.Seq) + "," +
+		"Pid:" + ar.Pid.String() + "," +
+		"}"
 }
 
-type DoneBroadcastReply struct {
+type LearnArgs struct {
+	Seq int
+	Val interface{}
+}
+
+type LearnReply struct {
 }
 
 type MsgType int
@@ -58,13 +95,14 @@ const (
 	AcceptReq
 	AcceptRes
 
+	LearnReq
+	LearnRes
+
 	StartProposer
 	Status
 	DoneSnap
 	MaxQuery
 	MinQuery
-
-	DoneBroadcast
 )
 
 var MsgTypeName = map[MsgType]string{
@@ -77,43 +115,30 @@ var MsgTypeName = map[MsgType]string{
 	DoneSnap:      "DoneSnap",
 	MaxQuery:      "MaxQuery",
 	MinQuery:      "MinQuery",
-	DoneBroadcast: "DoneBroadcast",
 }
 
 type Message struct {
 	Type MsgType
-	Id   uint64
-	From int
+	Id   int64
 	To   int
 
-	Seq  int
-	Pid  Pid
-	Fate int
+	IsForMySelf bool
 
-	Agree       bool
-	AcceptedPid Pid
-	Val         interface{}
+	Content interface{}
 }
 
 func (m *Message) String() string {
 	return "{Type: " + m.Type.String() + ", " +
 		"Id: " + strconv.Itoa(int(m.Id)) + ", " +
-		"From: " + strconv.Itoa(m.From) + ", " +
 		"To: " + strconv.Itoa(m.To) + ", " +
-		"Seq: " + strconv.Itoa(m.Seq) + ", " +
-		"Pid: " + m.Pid.String() + ", " +
-		"Fate: " + strconv.Itoa(m.Fate) + ", " +
-		"Agree: " + strconv.FormatBool(m.Agree) + ", " +
-		"AcceptedPid: " + m.AcceptedPid.String() + ", " +
-		"Val: " + fmt.Sprintf("%v", m.Val) + "}"
-
+		"Content: " + fmt.Sprintf("%v", m.Content)
 }
 
 type Context struct {
-	resc chan Message
+	resc chan interface{}
 }
 
-func (ctx *Context) Done() Message {
+func (ctx *Context) Done() interface{} {
 	return <-ctx.resc
 }
 
@@ -151,39 +176,30 @@ func (s *Pid) Equals(other Pid) bool {
 	return s.Suf == other.Suf && s.Pre == other.Pre
 }
 
-// ProposerId Generator
-type Sequence struct {
-	Server int
-	base   uint64
+func (s *Pid) EqualsZero() bool {
+	return s.Suf == 0
 }
 
-func (s *Sequence) Next() Pid {
+func (s *Pid) Next() Pid {
 	return Pid{
-		Pre: s.Server,
-		Suf: atomic.AddUint64(&s.base, 1),
+		Pre: s.Pre,
+		Suf: s.Suf + 1,
 	}
 }
 
-func (s *Sequence) Zero() Pid {
+func ZeroPid() Pid {
 	return Pid{
-		Pre: s.Server,
+		Pre: None,
 		Suf: 0,
 	}
 }
 
-// after call rebase(), call next() will always generate a big value than base
-func (s *Sequence) Rebase(base Pid) {
-	origin := atomic.LoadUint64(&s.base)
-	for origin < base.Suf && atomic.CompareAndSwapUint64(&s.base, origin, base.Suf) {
-		origin = atomic.LoadUint64(&s.base)
+func Min(arr []int) int {
+	min := math.MaxInt32
+	for _, v := range arr {
+		if v < min {
+			min = v
+		}
 	}
-}
-
-// Serialize ID generator
-type Serializer struct {
-	base uint64
-}
-
-func (s *Serializer) NextId() uint64 {
-	return atomic.AddUint64(&s.base, 1)
+	return min
 }
