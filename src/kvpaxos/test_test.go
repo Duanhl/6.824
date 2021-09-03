@@ -3,7 +3,6 @@ package kvpaxos
 import "testing"
 import "runtime"
 import "strconv"
-import "os"
 import "time"
 import "fmt"
 import "math/rand"
@@ -17,49 +16,20 @@ func check(t *testing.T, ck *Clerk, key string, value string) {
 	}
 }
 
-func port(tag string, host int) string {
-	s := "/var/tmp/824-"
-	s += strconv.Itoa(os.Getuid()) + "/"
-	os.Mkdir(s, 0777)
-	s += "kv-"
-	s += strconv.Itoa(os.Getpid()) + "-"
-	s += tag + "-"
-	s += strconv.Itoa(host)
-	return s
-}
-
-func cleanup(kva []*KVPaxos) {
-	for i := 0; i < len(kva); i++ {
-		if kva[i] != nil {
-			kva[i].kill()
-		}
-	}
-}
-
 // predict effect of Append(k, val) if old value is prev.
 func NextValue(prev string, val string) string {
 	return prev + val
 }
 
 func TestBasic(t *testing.T) {
-	runtime.GOMAXPROCS(4)
-
 	const nservers = 3
-	var kva []*KVPaxos = make([]*KVPaxos, nservers)
-	var kvh []string = make([]string, nservers)
-	defer cleanup(kva)
+	cfg := make_config(t, nservers, false)
+	defer cfg.cleanup()
 
-	for i := 0; i < nservers; i++ {
-		kvh[i] = port("basic", i)
-	}
-	for i := 0; i < nservers; i++ {
-		kva[i] = StartServer(kvh, i)
-	}
-
-	ck := MakeClerk(kvh)
+	ck := cfg.makeClient(cfg.All())
 	var cka [nservers]*Clerk
 	for i := 0; i < nservers; i++ {
-		cka[i] = MakeClerk([]string{kvh[i]})
+		cka[i] = cfg.makeClient([]int{i})
 	}
 
 	fmt.Printf("Test: Basic put/append/get ...\n")
@@ -89,7 +59,7 @@ func TestBasic(t *testing.T) {
 			go func(me int) {
 				defer func() { ca[me] <- true }()
 				ci := (rand.Int() % nservers)
-				myck := MakeClerk([]string{kvh[ci]})
+				myck := cfg.makeClient([]int{ci})
 				if (rand.Int() % 1000) < 500 {
 					myck.Put("b", strconv.Itoa(rand.Int()))
 				} else {
@@ -115,23 +85,14 @@ func TestBasic(t *testing.T) {
 }
 
 func TestDone(t *testing.T) {
-	runtime.GOMAXPROCS(4)
-
 	const nservers = 3
-	var kva []*KVPaxos = make([]*KVPaxos, nservers)
-	var kvh []string = make([]string, nservers)
-	defer cleanup(kva)
+	cfg := make_config(t, nservers, false)
+	defer cfg.cleanup()
 
-	for i := 0; i < nservers; i++ {
-		kvh[i] = port("done", i)
-	}
-	for i := 0; i < nservers; i++ {
-		kva[i] = StartServer(kvh, i)
-	}
-	ck := MakeClerk(kvh)
+	ck := cfg.makeClient(cfg.All())
 	var cka [nservers]*Clerk
 	for pi := 0; pi < nservers; pi++ {
-		cka[pi] = MakeClerk([]string{kvh[pi]})
+		cka[pi] = cfg.makeClient([]int{pi})
 	}
 
 	fmt.Printf("Test: server frees Paxos log memory...\n")
@@ -186,74 +147,20 @@ func TestDone(t *testing.T) {
 	fmt.Printf("  ... Passed\n")
 }
 
-func pp(tag string, src int, dst int) string {
-	s := "/var/tmp/824-"
-	s += strconv.Itoa(os.Getuid()) + "/"
-	s += "kv-" + tag + "-"
-	s += strconv.Itoa(os.Getpid()) + "-"
-	s += strconv.Itoa(src) + "-"
-	s += strconv.Itoa(dst)
-	return s
-}
-
-func cleanpp(tag string, n int) {
-	for i := 0; i < n; i++ {
-		for j := 0; j < n; j++ {
-			ij := pp(tag, i, j)
-			os.Remove(ij)
-		}
-	}
-}
-
-func part(t *testing.T, tag string, npaxos int, p1 []int, p2 []int, p3 []int) {
-	cleanpp(tag, npaxos)
-
-	pa := [][]int{p1, p2, p3}
-	for pi := 0; pi < len(pa); pi++ {
-		p := pa[pi]
-		for i := 0; i < len(p); i++ {
-			for j := 0; j < len(p); j++ {
-				ij := pp(tag, p[i], p[j])
-				pj := port(tag, p[j])
-				err := os.Link(pj, ij)
-				if err != nil {
-					t.Fatalf("os.Link(%v, %v): %v\n", pj, ij, err)
-				}
-			}
-		}
-	}
-}
-
 func TestPartition(t *testing.T) {
-	runtime.GOMAXPROCS(4)
-
-	tag := "partition"
 	const nservers = 5
-	var kva []*KVPaxos = make([]*KVPaxos, nservers)
-	defer cleanup(kva)
-	defer cleanpp(tag, nservers)
-
-	for i := 0; i < nservers; i++ {
-		var kvh []string = make([]string, nservers)
-		for j := 0; j < nservers; j++ {
-			if j == i {
-				kvh[j] = port(tag, i)
-			} else {
-				kvh[j] = pp(tag, i, j)
-			}
-		}
-		kva[i] = StartServer(kvh, i)
-	}
-	defer part(t, tag, nservers, []int{}, []int{}, []int{})
+	cfg := make_config(t, nservers, false)
+	defer cfg.cleanup()
 
 	var cka [nservers]*Clerk
 	for i := 0; i < nservers; i++ {
-		cka[i] = MakeClerk([]string{port(tag, i)})
+		cka[i] = cfg.makeClient([]int{i})
 	}
 
 	fmt.Printf("Test: No partition ...\n")
 
-	part(t, tag, nservers, []int{0, 1, 2, 3, 4}, []int{}, []int{})
+	cfg.partition([]int{0, 1, 2, 3, 4}, []int{})
+
 	cka[0].Put("1", "12")
 	cka[2].Put("1", "13")
 	check(t, cka[3], "1", "13")
@@ -262,7 +169,7 @@ func TestPartition(t *testing.T) {
 
 	fmt.Printf("Test: Progress in majority ...\n")
 
-	part(t, tag, nservers, []int{2, 3, 4}, []int{0, 1}, []int{})
+	cfg.partition([]int{2, 3, 4}, []int{0, 1})
 	cka[2].Put("1", "14")
 	check(t, cka[4], "1", "14")
 
@@ -297,7 +204,7 @@ func TestPartition(t *testing.T) {
 
 	fmt.Printf("Test: Completion after heal ...\n")
 
-	part(t, tag, nservers, []int{0, 2, 3, 4}, []int{1}, []int{})
+	cfg.partition([]int{0, 2, 3, 4}, []int{1})
 
 	select {
 	case <-done0:
@@ -314,7 +221,7 @@ func TestPartition(t *testing.T) {
 	check(t, cka[4], "1", "15")
 	check(t, cka[0], "1", "15")
 
-	part(t, tag, nservers, []int{0, 1, 2}, []int{3, 4}, []int{})
+	cfg.partition([]int{0, 1, 2}, []int{3, 4})
 
 	select {
 	case <-done1:
@@ -325,16 +232,6 @@ func TestPartition(t *testing.T) {
 	check(t, cka[1], "1", "15")
 
 	fmt.Printf("  ... Passed\n")
-}
-
-func randclerk(kvh []string) *Clerk {
-	sa := make([]string, len(kvh))
-	copy(sa, kvh)
-	for i := range sa {
-		j := rand.Intn(i + 1)
-		sa[i], sa[j] = sa[j], sa[i]
-	}
-	return MakeClerk(sa)
 }
 
 // check that all known appends are present in a value,
@@ -362,25 +259,14 @@ func checkAppends(t *testing.T, v string, counts []int) {
 }
 
 func TestUnreliable(t *testing.T) {
-	runtime.GOMAXPROCS(4)
-
 	const nservers = 3
-	var kva []*KVPaxos = make([]*KVPaxos, nservers)
-	var kvh []string = make([]string, nservers)
-	defer cleanup(kva)
+	cfg := make_config(t, nservers, true)
+	defer cfg.cleanup()
 
-	for i := 0; i < nservers; i++ {
-		kvh[i] = port("un", i)
-	}
-	for i := 0; i < nservers; i++ {
-		kva[i] = StartServer(kvh, i)
-		kva[i].setunreliable(true)
-	}
-
-	ck := MakeClerk(kvh)
+	ck := cfg.makeClient(cfg.All())
 	var cka [nservers]*Clerk
 	for i := 0; i < nservers; i++ {
-		cka[i] = MakeClerk([]string{kvh[i]})
+		cka[i] = cfg.makeClient([]int{i})
 	}
 
 	fmt.Printf("Test: Basic put/get, unreliable ...\n")
@@ -406,7 +292,7 @@ func TestUnreliable(t *testing.T) {
 			go func(me int) {
 				ok := false
 				defer func() { ca[me] <- ok }()
-				myck := randclerk(kvh)
+				myck := cfg.makeClient(cfg.All())
 				key := strconv.Itoa(me)
 				vv := myck.Get(key)
 				myck.Append(key, "0")
@@ -444,7 +330,7 @@ func TestUnreliable(t *testing.T) {
 			ca[cli] = make(chan bool)
 			go func(me int) {
 				defer func() { ca[me] <- true }()
-				myck := randclerk(kvh)
+				myck := cfg.makeClient(cfg.All())
 				if (rand.Int() % 1000) < 500 {
 					myck.Put("b", strconv.Itoa(rand.Int()))
 				} else {
@@ -474,7 +360,7 @@ func TestUnreliable(t *testing.T) {
 	ff := func(me int, ch chan int) {
 		ret := -1
 		defer func() { ch <- ret }()
-		myck := randclerk(kvh)
+		myck := cfg.makeClient(cfg.All())
 		n := 0
 		for n < 5 {
 			myck.Append("k", "x "+strconv.Itoa(me)+" "+strconv.Itoa(n)+" y")
@@ -517,33 +403,16 @@ func TestUnreliable(t *testing.T) {
 }
 
 func TestHole(t *testing.T) {
-	runtime.GOMAXPROCS(4)
+	const nservers = 5
+	cfg := make_config(t, nservers, false)
+	defer cfg.cleanup()
 
 	fmt.Printf("Test: Tolerates holes in paxos sequence ...\n")
 
-	tag := "hole"
-	const nservers = 5
-	var kva []*KVPaxos = make([]*KVPaxos, nservers)
-	defer cleanup(kva)
-	defer cleanpp(tag, nservers)
-
-	for i := 0; i < nservers; i++ {
-		var kvh []string = make([]string, nservers)
-		for j := 0; j < nservers; j++ {
-			if j == i {
-				kvh[j] = port(tag, i)
-			} else {
-				kvh[j] = pp(tag, i, j)
-			}
-		}
-		kva[i] = StartServer(kvh, i)
-	}
-	defer part(t, tag, nservers, []int{}, []int{}, []int{})
-
 	for iters := 0; iters < 5; iters++ {
-		part(t, tag, nservers, []int{0, 1, 2, 3, 4}, []int{}, []int{})
+		cfg.partition([]int{0, 1, 2, 3, 4}, []int{})
 
-		ck2 := MakeClerk([]string{port(tag, 2)})
+		ck2 := cfg.makeClient([]int{2})
 		ck2.Put("q", "q")
 
 		done := int32(0)
@@ -556,7 +425,7 @@ func TestHole(t *testing.T) {
 				defer func() { ca[cli] <- ok }()
 				var cka [nservers]*Clerk
 				for i := 0; i < nservers; i++ {
-					cka[i] = MakeClerk([]string{port(tag, i)})
+					cka[i] = cfg.makeClient([]int{i})
 				}
 				key := strconv.Itoa(cli)
 				last := ""
@@ -581,7 +450,7 @@ func TestHole(t *testing.T) {
 
 		time.Sleep(3 * time.Second)
 
-		part(t, tag, nservers, []int{2, 3, 4}, []int{0, 1}, []int{})
+		cfg.partition([]int{2, 3, 4}, []int{0, 1})
 
 		// can majority partition make progress even though
 		// minority servers were interrupted in the middle of
@@ -591,7 +460,7 @@ func TestHole(t *testing.T) {
 		check(t, ck2, "q", "qq")
 
 		// restore network, wait for all threads to exit.
-		part(t, tag, nservers, []int{0, 1, 2, 3, 4}, []int{}, []int{})
+		cfg.partition([]int{0, 1, 2, 3, 4}, []int{})
 		atomic.StoreInt32(&done, 1)
 		ok := true
 		for i := 0; i < nclients; i++ {
@@ -608,30 +477,11 @@ func TestHole(t *testing.T) {
 }
 
 func TestManyPartition(t *testing.T) {
-	runtime.GOMAXPROCS(4)
+	const nservers = 5
+	cfg := make_config(t, nservers, true)
+	defer cfg.cleanup()
 
 	fmt.Printf("Test: Many clients, changing partitions ...\n")
-
-	tag := "many"
-	const nservers = 5
-	var kva []*KVPaxos = make([]*KVPaxos, nservers)
-	defer cleanup(kva)
-	defer cleanpp(tag, nservers)
-
-	for i := 0; i < nservers; i++ {
-		var kvh []string = make([]string, nservers)
-		for j := 0; j < nservers; j++ {
-			if j == i {
-				kvh[j] = port(tag, i)
-			} else {
-				kvh[j] = pp(tag, i, j)
-			}
-		}
-		kva[i] = StartServer(kvh, i)
-		kva[i].setunreliable(true)
-	}
-	defer part(t, tag, nservers, []int{}, []int{}, []int{})
-	part(t, tag, nservers, []int{0, 1, 2, 3, 4}, []int{}, []int{})
 
 	done := int32(0)
 
@@ -642,10 +492,10 @@ func TestManyPartition(t *testing.T) {
 		for atomic.LoadInt32(&done) == 0 {
 			var a [nservers]int
 			for i := 0; i < nservers; i++ {
-				a[i] = (rand.Int() % 3)
+				a[i] = (rand.Int() % 2)
 			}
-			pa := make([][]int, 3)
-			for i := 0; i < 3; i++ {
+			pa := make([][]int, 2)
+			for i := 0; i < 2; i++ {
 				pa[i] = make([]int, 0)
 				for j := 0; j < nservers; j++ {
 					if a[j] == i {
@@ -653,7 +503,7 @@ func TestManyPartition(t *testing.T) {
 					}
 				}
 			}
-			part(t, tag, nservers, pa[0], pa[1], pa[2])
+			cfg.partition(pa[0], pa[1])
 			time.Sleep(time.Duration(rand.Int63()%200) * time.Millisecond)
 		}
 	}()
@@ -665,15 +515,8 @@ func TestManyPartition(t *testing.T) {
 		go func(cli int) {
 			ok := false
 			defer func() { ca[cli] <- ok }()
-			sa := make([]string, nservers)
-			for i := 0; i < nservers; i++ {
-				sa[i] = port(tag, i)
-			}
-			for i := range sa {
-				j := rand.Intn(i + 1)
-				sa[i], sa[j] = sa[j], sa[i]
-			}
-			myck := MakeClerk(sa)
+
+			myck := cfg.makeClient(cfg.All())
 			key := strconv.Itoa(cli)
 			last := ""
 			myck.Put(key, last)
@@ -697,7 +540,7 @@ func TestManyPartition(t *testing.T) {
 	time.Sleep(20 * time.Second)
 	atomic.StoreInt32(&done, 1)
 	<-ch1
-	part(t, tag, nservers, []int{0, 1, 2, 3, 4}, []int{}, []int{})
+	cfg.partition([]int{0, 1, 2, 3, 4}, []int{})
 
 	ok := true
 	for i := 0; i < nclients; i++ {

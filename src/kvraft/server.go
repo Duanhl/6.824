@@ -182,6 +182,7 @@ func (kv *KVServer) run() {
 			}
 		}
 	}
+	DPrintf("server end up")
 }
 
 func (kv *KVServer) apply(applyMsg raft.ApplyMsg) {

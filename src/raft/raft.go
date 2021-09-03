@@ -931,24 +931,20 @@ func (rf *Raft) registerRPC(msg Message) Context {
 	rf.stateLock.Lock()
 	defer rf.stateLock.Unlock()
 
-	if rf.rpcm == nil { //stopped
-		ctx := Context{resc: make(chan Message)}
-		ctx.resc <- Message{
-			Term:     0,
-			Agreed:   false,
-			IsLeader: false,
+	if rf.killed() == false {
+		id := rf.idg.NextId()
+		context := Context{
+			resc: make(chan Message),
 		}
+		msg.Id = id
+		rf.rpcm[id] = context
+		rf.recv <- msg
+		return context
+	} else {
+		ctx := Context{resc: make(chan Message)}
+		close(ctx.resc)
 		return ctx
 	}
-
-	id := rf.idg.NextId()
-	context := Context{
-		resc: make(chan Message),
-	}
-	msg.Id = id
-	rf.rpcm[id] = context
-	rf.recv <- msg
-	return context
 }
 
 func (rf *Raft) filter(msg Message) bool {
@@ -971,7 +967,9 @@ func (rf *Raft) filter(msg Message) bool {
 }
 
 func (rf *Raft) retry(msg Message) {
-	rf.recv <- msg
+	if !rf.killed() {
+		rf.recv <- msg
+	}
 }
 
 func (rf *Raft) remote(msg Message) {
@@ -1237,6 +1235,7 @@ func (storage *Storage) updateSnapshot(prevTerm int, prevIndex int, snapshot []b
 			Term:    prevTerm,
 		}}
 	} else {
+		//fixme use sliced slice doesn't free memory
 		storage.ents = storage.ents[prevIndex-storage.ents[0].Index:]
 		storage.ents[0] = LogEntry{
 			Command: nil,

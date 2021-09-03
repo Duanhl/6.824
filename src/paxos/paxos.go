@@ -21,13 +21,12 @@ package paxos
 //
 
 import (
+	"6.824/labrpc"
 	"net"
 	"time"
 )
 import "net/rpc"
-import "log"
 
-import "os"
 import "syscall"
 import "sync"
 import "sync/atomic"
@@ -69,20 +68,6 @@ func randomTimeout(base int64) time.Duration {
 	return time.Duration(base+rand.Int63n(base)) * time.Millisecond
 }
 
-type Instances struct {
-	ents    []Instance
-	prevSeq int
-}
-
-func (i *Instances) LastSeq() int {
-	l := len(i.ents)
-	if l == 0 {
-		return i.prevSeq
-	} else {
-		return i.ents[l-1].seq
-	}
-}
-
 type Instance struct {
 	seq  int
 	fate Fate
@@ -115,16 +100,15 @@ type Timeout struct {
 }
 
 type Paxos struct {
-	mu         sync.Mutex
-	l          net.Listener
-	dead       int32 // for testing
-	unreliable int32 // for testing
-	rpcCount   int32 // for testing
-	peers      []string
-	me         int // index into peers[]
+	mu       sync.Mutex
+	l        net.Listener
+	dead     int32 // for testing
+	rpcCount int32 // for testing
+	peers    []*labrpc.ClientEnd
+	me       int // index into peers[]
 
 	// Your data here.
-	instances Instances
+	instances []*Instance
 
 	quorum int
 	keep   []int // for Done(), Min()
@@ -267,8 +251,9 @@ func (px *Paxos) Min() int {
 }
 
 type InsStatus struct {
-	fate Fate
-	val  interface{}
+	Seq  int
+	Fate Fate
+	Val  interface{}
 }
 
 // Status
@@ -285,10 +270,10 @@ func (px *Paxos) Status(seq int) (Fate, interface{}) {
 		Content: seq,
 	})
 	msg := ctx.Done().(InsStatus)
-	return msg.fate, msg.val
+	return msg.Fate, msg.Val
 }
 
-func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
+func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) {
 	ctx := px.register(Message{
 		Type: PrepareReq,
 		Content: PrepareArgs{
@@ -304,10 +289,10 @@ func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
 	reply.AcceptedVal = msg.AcceptedVal
 	reply.AcceptedPid = msg.AcceptedPid
 
-	return nil
+	return
 }
 
-func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
+func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) {
 	ctx := px.register(Message{
 		Type: AcceptReq,
 		Content: AcceptArgs{
@@ -321,10 +306,10 @@ func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
 	reply.Agree = msg.Agree
 	reply.AcceptedPid = msg.AcceptedPid
 
-	return nil
+	return
 }
 
-func (px *Paxos) Learn(args *LearnArgs, reply *LearnReply) error {
+func (px *Paxos) Learn(args *LearnArgs, reply *LearnReply) {
 	ctx := px.register(Message{
 		Type: LearnReq,
 		Content: LearnArgs{
@@ -333,7 +318,7 @@ func (px *Paxos) Learn(args *LearnArgs, reply *LearnReply) error {
 		},
 	})
 	ctx.Done()
-	return nil
+	return
 }
 
 // Kill
@@ -355,34 +340,22 @@ func (px *Paxos) isdead() bool {
 	return atomic.LoadInt32(&px.dead) != 0
 }
 
-// please do not change these two functions.
-func (px *Paxos) setunreliable(what bool) {
-	if what {
-		atomic.StoreInt32(&px.unreliable, 1)
-	} else {
-		atomic.StoreInt32(&px.unreliable, 0)
-	}
-}
-
-func (px *Paxos) isunreliable() bool {
-	return atomic.LoadInt32(&px.unreliable) != 0
-}
-
 // Make
 // the application wants to create a paxos peer.
 // the ports of all the paxos peers (including this one)
 // are in peers[]. this servers port is peers[me].
 //
-func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
+func Make(peers []*labrpc.ClientEnd, me int) *Paxos {
 	px := &Paxos{}
 	px.peers = peers
 	px.me = me
 
 	// Your initialization code here.
-	px.instances = Instances{
-		ents:    []Instance{},
-		prevSeq: -1,
-	}
+	px.instances = []*Instance{}
+	px.instances = append(px.instances, &Instance{
+		seq:  -1,
+		fate: Forgotten,
+	})
 
 	px.quorum = len(peers)/2 + 1
 	px.keep = make([]int, len(peers))
@@ -404,57 +377,6 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 
 	go px.run()
 	go px.out()
-
-	if rpcs != nil {
-		// caller will create socket &c
-		rpcs.Register(px)
-	} else {
-		rpcs = rpc.NewServer()
-		rpcs.Register(px)
-
-		// prepare to receive connections from clients.
-		// change "unix" to "tcp" to use over a network.
-		os.Remove(peers[me]) // only needed for "unix"
-		l, e := net.Listen("unix", peers[me])
-		if e != nil {
-			log.Fatal("listen error: ", e)
-		}
-		px.l = l
-
-		// please do not change any of the following code,
-		// or do anything to subvert it.
-
-		// create a thread to accept RPC connections
-		go func() {
-			for px.isdead() == false {
-				conn, err := px.l.Accept()
-				if err == nil && px.isdead() == false {
-					if px.isunreliable() && (rand.Int63()%1000) < 100 {
-						// discard the request.
-						conn.Close()
-					} else if px.isunreliable() && (rand.Int63()%1000) < 200 {
-						// process the request but force discard of reply.
-						c1 := conn.(*net.UnixConn)
-						f, _ := c1.File()
-						err := syscall.Shutdown(int(f.Fd()), syscall.SHUT_WR)
-						if err != nil {
-							fmt.Printf("shutdown: %v\n", err)
-						}
-						atomic.AddInt32(&px.rpcCount, 1)
-						go rpcs.ServeConn(conn)
-					} else {
-						atomic.AddInt32(&px.rpcCount, 1)
-						go rpcs.ServeConn(conn)
-					}
-				} else if err == nil {
-					conn.Close()
-				}
-				if err != nil && px.isdead() == false {
-					fmt.Printf("Paxos(%v) accept: %v\n", me, err.Error())
-				}
-			}
-		}()
-	}
 
 	return px
 }
@@ -577,7 +499,7 @@ func (px *Paxos) remote(msg Message) {
 			Proposer: px.me,
 		}
 		reply := &PrepareReply{}
-		if call(px.peers[msg.To], "Paxos.Prepare", args, reply) {
+		if px.peers[msg.To].Call("Paxos.Prepare", args, reply) {
 			px.recv <- Message{
 				Type: PrepareRes,
 				Content: PrepareReply{
@@ -601,7 +523,7 @@ func (px *Paxos) remote(msg Message) {
 		}
 
 		reply := &AcceptReply{}
-		if call(px.peers[msg.To], "Paxos.Accept", args, reply) {
+		if px.peers[msg.To].Call("Paxos.Accept", args, reply) {
 			px.recv <- Message{
 				Type: AcceptRes,
 				Content: AcceptReply{
@@ -623,7 +545,7 @@ func (px *Paxos) remote(msg Message) {
 			Val: c.Val,
 		}
 		reply := &LearnReply{}
-		if !call(px.peers[msg.To], "Paxos.Learn", args, reply) {
+		if !px.peers[msg.To].Call("Paxos.Learn", args, reply) {
 			px.retry(msg)
 		}
 	default:
@@ -650,7 +572,6 @@ func (px *Paxos) handleStart(id int64, seq int, val interface{}) {
 	if ins.fate == NotReady {
 		ins.ps.candidate = val
 		ins.fate = Pending
-		px.updateInstance(ins)
 
 		px.startPrepare(seq)
 	}
@@ -667,8 +588,8 @@ func (px *Paxos) handleStatus(id int64, seq int) {
 		Type: Status,
 		Id:   id,
 		Content: InsStatus{
-			fate: ins.fate,
-			val:  ins.val,
+			Fate: ins.fate,
+			Val:  ins.val,
 		},
 	})
 }
@@ -692,7 +613,7 @@ func (px *Paxos) handleMinQuery(id int64) {
 }
 
 func (px *Paxos) handleMaxQuery(id int64) {
-	lastSeq := px.instances.LastSeq()
+	lastSeq := px.instances[len(px.instances)-1].seq
 	px.sendMessage(Message{
 		Type:    MaxQuery,
 		Id:      id,
@@ -731,8 +652,6 @@ func (px *Paxos) startPrepare(seq int) {
 	ins.ps.maxAccVal = nil
 	ins.ps.phase = Prepare
 
-	px.updateInstance(ins)
-
 	DPrintf("server %v start prepare: [%v, %s]", px.me, seq, choose.String())
 	for i := 0; i < len(px.peers); i++ {
 		px.outc <- Message{
@@ -760,6 +679,7 @@ func (px *Paxos) startPrepare(seq int) {
 
 func (px *Paxos) startAccept(seq int) {
 	ins := px.instanceAt(seq)
+	choose := ins.ps.choose
 
 	DPrintf("server %v start accept: [%v, %s]", px.me, seq, ins.ps.choose.String())
 	for i := 0; i < len(px.peers); i++ {
@@ -779,7 +699,7 @@ func (px *Paxos) startAccept(seq int) {
 	time.AfterFunc(randomTimeout(ProcessBase), func() {
 		px.timec <- Timeout{
 			seq:   seq,
-			pid:   ins.ps.choose,
+			pid:   choose,
 			phase: Accept,
 		}
 	})
@@ -810,7 +730,7 @@ func (px *Paxos) updateMaxSeenPid(pid Pid) {
 }
 
 func (px *Paxos) handleLearn(id int64, args LearnArgs) {
-	if args.Seq <= px.instances.prevSeq {
+	if args.Seq <= px.instances[0].seq {
 		px.sendMessage(Message{
 			Type: LearnRes,
 			Id:   id,
@@ -821,7 +741,6 @@ func (px *Paxos) handleLearn(id int64, args LearnArgs) {
 	ins.fate = Decided
 	ins.val = args.Val
 	ins.ps.phase = Done
-	px.updateInstance(ins)
 
 	DPrintf("server %v learn: [%v, %v]", px.me, args.Seq, args.Val)
 	px.sendMessage(Message{
@@ -835,7 +754,7 @@ func (px *Paxos) handlePrepare(id int64, args PrepareArgs, isForMySelf bool) {
 	px.checkAndForgotten(args.Proposer, args.Done)
 
 	// instance always decided and forgotten
-	if args.Seq <= px.instances.prevSeq {
+	if args.Seq <= px.instances[0].seq {
 		px.sendMessage(Message{
 			Type:        PrepareRes,
 			Id:          id,
@@ -858,7 +777,6 @@ func (px *Paxos) handlePrepare(id int64, args PrepareArgs, isForMySelf bool) {
 
 	if args.Pid.Equals(ins.as.promise) || args.Pid.After(ins.as.promise) {
 		ins.as.promise = args.Pid
-		px.updateInstance(ins)
 
 		reply.Agree = true
 		reply.AcceptedVal = ins.as.accVal
@@ -905,7 +823,6 @@ func (px *Paxos) handlePrepareRes(reply PrepareReply) {
 				ins.ps.maxAccPid = reply.AcceptedPid
 				ins.ps.maxAccVal = reply.AcceptedVal
 			}
-			px.updateInstance(ins)
 
 			if ins.ps.vote == px.quorum {
 				if ins.ps.maxAccVal != nil {
@@ -915,12 +832,10 @@ func (px *Paxos) handlePrepareRes(reply PrepareReply) {
 				ins.ps.vote = 0
 				ins.ps.reject = 0
 
-				px.updateInstance(ins)
 				px.startAccept(reply.Seq)
 			}
 		} else {
 			ins.ps.reject += 1
-			px.updateInstance(ins)
 
 			// update maxSeenPid
 			px.updateMaxSeenPid(reply.AcceptedPid)
@@ -933,7 +848,7 @@ func (px *Paxos) handlePrepareRes(reply PrepareReply) {
 }
 
 func (px *Paxos) handleAccept(id int64, args AcceptArgs, isForMySelf bool) {
-	if args.Seq <= px.instances.prevSeq {
+	if args.Seq <= px.instances[0].seq {
 		px.sendMessage(Message{
 			Type:        AcceptRes,
 			Id:          id,
@@ -957,7 +872,6 @@ func (px *Paxos) handleAccept(id int64, args AcceptArgs, isForMySelf bool) {
 		ins.as.promise = args.Pid
 		ins.as.accPid = args.Pid
 		ins.as.accVal = args.Val
-		px.updateInstance(ins)
 
 		reply.Agree = true
 		reply.AcceptedPid = ins.as.promise
@@ -1005,11 +919,8 @@ func (px *Paxos) handleAcceptRes(reply AcceptReply) {
 
 				px.startLearn(ins.seq, ins.val)
 			}
-
-			px.updateInstance(ins)
 		} else {
 			ins.ps.reject += 1
-			px.updateInstance(ins)
 
 			// update maxSeenPid
 			px.updateMaxSeenPid(reply.AcceptedPid)
@@ -1021,27 +932,24 @@ func (px *Paxos) handleAcceptRes(reply AcceptReply) {
 	}
 }
 
+var ForgottenInstance = &Instance{
+	seq:  -1,
+	fate: Forgotten,
+}
+
 // found instance at seq, if seq smaller than first seq, return forgotten instance
 // if seq bigger than last seq, create instance and full it util seq
 //  |dummy instance| ---> |normal instances|
 //
-func (px *Paxos) instanceAt(seq int) Instance {
-	if seq <= px.instances.prevSeq {
-		return Instance{
-			seq:  seq,
-			fate: Forgotten,
-		}
+func (px *Paxos) instanceAt(seq int) *Instance {
+	firstSeq := px.instances[0].seq
+	lastSeq := px.instances[len(px.instances)-1].seq
+	if seq <= firstSeq {
+		return ForgottenInstance
 	}
-	var maxSeq int
-	l := len(px.instances.ents)
-	if l == 0 {
-		maxSeq = px.instances.prevSeq
-	} else {
-		maxSeq = px.instances.ents[l-1].seq
-	}
-	if seq > maxSeq {
-		for i := maxSeq + 1; i <= seq; i++ {
-			px.instances.ents = append(px.instances.ents, Instance{
+	if seq > lastSeq {
+		for i := lastSeq + 1; i <= seq; i++ {
+			px.instances = append(px.instances, &Instance{
 				seq:  i,
 				fate: NotReady,
 				as: AcceptorState{
@@ -1052,25 +960,23 @@ func (px *Paxos) instanceAt(seq int) Instance {
 			})
 		}
 	}
-	return px.instances.ents[seq-px.instances.prevSeq-1]
-}
-
-// call after instanceAt, always in instances
-func (px *Paxos) updateInstance(ins Instance) {
-	px.instances.ents[ins.seq-px.instances.prevSeq-1] = ins
+	return px.instances[seq-firstSeq]
 }
 
 // drop instance where ents.seq <= seq
 func (px *Paxos) drop(seq int) {
-	if seq <= px.instances.prevSeq {
+	first := px.instances[0].seq
+	if seq <= first {
 		return
 	}
 	// use sliced slice can't free memory, copy a new slice instead
-	ents := px.instances.ents[seq-px.instances.prevSeq:]
-	px.instances.ents = []Instance{}
+	ents := px.instances[seq-first:]
+	px.instances = []*Instance{{
+		seq:  seq,
+		fate: Forgotten,
+	}}
 	for _, ins := range ents {
-		px.instances.ents = append(px.instances.ents, ins)
+		px.instances = append(px.instances, ins)
 	}
 	ents = nil
-	px.instances.prevSeq = seq
 }

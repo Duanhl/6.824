@@ -1,16 +1,15 @@
 package kvpaxos
 
-import "net"
-import "fmt"
-import "net/rpc"
+import (
+	"6.824/labrpc"
+	"container/heap"
+	"net"
+)
 import "log"
 import "6.824/paxos"
 import "sync"
 import "sync/atomic"
-import "os"
-import "syscall"
 import "encoding/gob"
-import "math/rand"
 
 const Debug = 0
 
@@ -36,17 +35,46 @@ type KVPaxos struct {
 	px         *paxos.Paxos
 
 	// Your definitions here.
+	store       map[string]string
+	applyc      chan paxos.InsStatus
+	prevApplied int
+	reqsbuf     map[int64]bool
+	applybuf    heap.Interface
 }
 
-func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
-	// Your code here.
-	return nil
+type StatusHeap []paxos.InsStatus
+
+func (sh StatusHeap) Len() int {
+	return len(sh)
 }
 
-func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
+func (sh StatusHeap) Swap(i, j int) {
+	sh[i], sh[j] = sh[j], sh[i]
+}
+
+func (sh StatusHeap) Less(i, j int) bool {
+	return sh[i].Seq < sh[j].Seq
+}
+
+func (sh *StatusHeap) Push(x interface{}) {
+	*sh = append(*sh, x.(paxos.InsStatus))
+}
+
+func (sh *StatusHeap) Pop() interface{} {
+	x := (*sh)[0]
+	*sh = (*sh)[1:]
+	return x
+}
+
+func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) {
+	// Your code here.
+	return
+}
+
+func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 
-	return nil
+	return
 }
 
 // tell the server to shut itself down.
@@ -63,26 +91,13 @@ func (kv *KVPaxos) isdead() bool {
 	return atomic.LoadInt32(&kv.dead) != 0
 }
 
-// please do not change these two functions.
-func (kv *KVPaxos) setunreliable(what bool) {
-	if what {
-		atomic.StoreInt32(&kv.unreliable, 1)
-	} else {
-		atomic.StoreInt32(&kv.unreliable, 0)
-	}
-}
-
-func (kv *KVPaxos) isunreliable() bool {
-	return atomic.LoadInt32(&kv.unreliable) != 0
-}
-
 //
 // servers[] contains the ports of the set of
 // servers that will cooperate via Paxos to
 // form the fault-tolerant key/value service.
 // me is the index of the current server in servers[].
 //
-func StartServer(servers []string, me int) *KVPaxos {
+func StartServer(servers []*labrpc.ClientEnd, me int) *KVPaxos {
 	// call gob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	gob.Register(Op{})
@@ -92,49 +107,7 @@ func StartServer(servers []string, me int) *KVPaxos {
 
 	// Your initialization code here.
 
-	rpcs := rpc.NewServer()
-	rpcs.Register(kv)
-
-	kv.px = paxos.Make(servers, me, rpcs)
-
-	os.Remove(servers[me])
-	l, e := net.Listen("unix", servers[me])
-	if e != nil {
-		log.Fatal("listen error: ", e)
-	}
-	kv.l = l
-
-	// please do not change any of the following code,
-	// or do anything to subvert it.
-
-	go func() {
-		for kv.isdead() == false {
-			conn, err := kv.l.Accept()
-			if err == nil && kv.isdead() == false {
-				if kv.isunreliable() && (rand.Int63()%1000) < 100 {
-					// discard the request.
-					conn.Close()
-				} else if kv.isunreliable() && (rand.Int63()%1000) < 200 {
-					// process the request but force discard of reply.
-					c1 := conn.(*net.UnixConn)
-					f, _ := c1.File()
-					err := syscall.Shutdown(int(f.Fd()), syscall.SHUT_WR)
-					if err != nil {
-						fmt.Printf("shutdown: %v\n", err)
-					}
-					go rpcs.ServeConn(conn)
-				} else {
-					go rpcs.ServeConn(conn)
-				}
-			} else if err == nil {
-				conn.Close()
-			}
-			if err != nil && kv.isdead() == false {
-				fmt.Printf("KVPaxos(%v) accept: %v\n", me, err.Error())
-				kv.kill()
-			}
-		}
-	}()
+	kv.px = paxos.Make(servers, me)
 
 	return kv
 }
