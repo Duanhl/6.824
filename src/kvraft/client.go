@@ -2,7 +2,8 @@ package kvraft
 
 import (
 	"6.824/labrpc"
-	"time"
+	"math"
+	"sync"
 )
 import "crypto/rand"
 import "math/big"
@@ -10,10 +11,8 @@ import "math/big"
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
-
-	leader int
-	msgCh  chan ClientMsg
-	resMap map[int64]chan ClientMsg
+	mu      sync.Mutex
+	healthy []int
 }
 
 func nrand() int64 {
@@ -27,6 +26,10 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.healthy = make([]int, len(ck.servers))
+	for i := 0; i < len(ck.healthy); i++ {
+		ck.healthy[i] = 1
+	}
 	return ck
 }
 
@@ -45,39 +48,41 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
+loop:
 	args := &GetArgs{
 		Key: key,
 		Id:  nrand(),
 	}
 	reply := &GetReply{}
-	for true {
-		DPrintf("client call get: (%v, %v)", args.Id, args.Key)
-		if ok := ck.servers[ck.leader].Call("KVServer.Get", args, reply); ok {
-			switch reply.Err {
-			case OK:
-				DPrintf("client call return: (%v, %v)", args.Id, reply.Value)
-				return reply.Value
-			case ErrNoKey:
-				DPrintf("client call return: (%v, '')", args.Id)
-				return ""
-			case ErrWrongLeader:
-				ck.loopForNextLeader()
-			}
-		} else {
-			time.Sleep(time.Millisecond * 50)
-			ck.loopForNextLeader()
+	i := ck.availableServer()
+	if ok := ck.servers[i].Call("KVServer.Get", args, reply); ok {
+		if reply.Err == OK {
+			return reply.Value
+		} else if reply.Err == ErrNoKey {
+			return ""
 		}
 	}
+	ck.mu.Lock()
+	ck.healthy[i]++
+	ck.mu.Unlock()
 
-	return ""
+	goto loop
 }
 
-func (ck *Clerk) loopForNextLeader() {
-	if ck.leader == len(ck.servers)-1 {
-		ck.leader = 0
-	} else {
-		ck.leader++
+func (ck *Clerk) availableServer() int {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+
+	server := None
+	m := math.MaxInt32
+
+	for i := 0; i < len(ck.servers); i++ {
+		if ck.healthy[i] < m {
+			m = ck.healthy[i]
+			server = i
+		}
 	}
+	return server
 }
 
 //
@@ -92,32 +97,26 @@ func (ck *Clerk) loopForNextLeader() {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
-
 	args := &PutAppendArgs{
+		Op:    op,
 		Key:   key,
 		Value: value,
-		Op:    op,
 		Id:    nrand(),
 	}
+loop:
 	reply := &PutAppendReply{}
-	for true {
-		DPrintf("client call %v: (%v, %v, %v)", args.Op, args.Id, args.Key, args.Value)
-		if ok := ck.servers[ck.leader].Call("KVServer.PutAppend", args, reply); ok {
-			switch reply.Err {
-			case OK:
-				DPrintf("client call putappend return: (%v, %v)", args.Id, reply.Err)
-				return
-			case ErrNoKey:
-				DPrintf("error, client call putappend return: (%v)", args.Id)
-				return
-			case ErrWrongLeader:
-				ck.loopForNextLeader()
-			}
-		} else {
-			time.Sleep(time.Microsecond * 20)
-			ck.loopForNextLeader()
+	i := ck.availableServer()
+	if ok := ck.servers[i].Call("KVServer.PutAppend", args, reply); ok {
+		if reply.Err == OK {
+			return
 		}
 	}
+
+	ck.mu.Lock()
+	ck.healthy[i]++
+	ck.mu.Unlock()
+
+	goto loop
 }
 
 func (ck *Clerk) Put(key string, value string) {
