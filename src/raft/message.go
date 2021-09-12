@@ -1,61 +1,90 @@
 package raft
 
+import (
+	"encoding/json"
+	"strconv"
+)
+
 type MessageType int32
 
 const (
-	MsgVoteRequest MessageType = iota
-	MsgVoteResponse
-	MsgAppendRequest
-	MsgAppendResponse
+	VoteRequest MessageType = iota + 1
+	VoteResponse
 
-	MsgInstallSnapshotRequest
-	MsgInstallSnapshotResponse
-	MsgSnapshot
-	MsgCondInstallSnapshot
+	AppendRequest
+	AppendResponse
 
-	MsgAppendCommand
-	MsgGetState
+	InstallSnapshotRequest
+	InstallSnapshotResponse
+
+	DoSnapshot
+	CondInstallSnapshot
+
+	AppendCommand
+	GetState
 )
 
+var MessageTypeMap = map[MessageType]string{
+	VoteRequest:             "VoteRequest",
+	VoteResponse:            "VoteResponse",
+	AppendRequest:           "AppendRequest",
+	AppendResponse:          "AppendResponse",
+	InstallSnapshotRequest:  "InstallSnapshotRequest",
+	InstallSnapshotResponse: "InstallSnapshotResponse",
+	DoSnapshot:              "DoSnapshot",
+	CondInstallSnapshot:     "CondInstallSnapshot",
+	AppendCommand:           "AppendCommand",
+	GetState:                "GetState",
+}
+
+func (m MessageType) String() string {
+	return MessageTypeMap[m]
+}
+
 type Message struct {
-	MType        MessageType
-	Id           int64
-	From         int
-	To           int
-	Term         int
-	PrevLogIdx   int
-	PrevLogTerm  int
-	Entries      []LogEntry
-	LeaderCommit int
-	Command      interface{}
-	Data         []byte
+	Type MessageType "message type"
+	Id   uint64      "message id"
+	From int         "what peer the message from"
+	To   int         "what peer the message will sent"
 
-	Agreed bool
+	Term    int         "message term"
+	Content interface{} "message body"
+}
 
+func (m Message) String() string {
+	js := "\n{\n  type:" + m.Type.String() + ",\n"
+	js += "  from:" + strconv.Itoa(m.From) + ",\n"
+	js += "  to:" + strconv.Itoa(m.To) + ",\n"
+	if b, err := json.Marshal(m.Content); err == nil {
+		js += "  content:" + string(b) + "\n}"
+	} else {
+		js += "  content: nil \n}"
+	}
+	return js
+}
+
+// for getState
+type StateInfo struct {
+	Term     int
 	IsLeader bool
 }
 
-type MessageSorter []Message
-
-func (ms MessageSorter) Len() int {
-	return len(ms)
+// for start req
+type StartInfo struct {
+	Index    int
+	Term     int
+	IsLeader bool
 }
 
-func (ms MessageSorter) Swap(i, j int) {
-	ms[i], ms[j] = ms[j], ms[i]
+// for do snapshot args
+type SnapshotArgs struct {
+	LastIncludedTerm  int
+	LastIncludedIndex int
+	Snapshot          []byte
 }
 
-func (ms MessageSorter) Less(i, j int) bool {
-	if ms[i].PrevLogIdx < ms[j].PrevLogIdx {
-		return false
-	} else if ms[i].PrevLogIdx == ms[j].PrevLogIdx {
-		return len(ms[i].Entries) < len(ms[j].Entries)
-	} else {
-		return true
-	}
-}
-
-type LogEntry struct {
+// log entry
+type Entry struct {
 	Command interface{}
 	Term    int
 	Index   int
