@@ -102,7 +102,7 @@ type Raft struct {
 	commitIndex int
 	sn          []byte //snapshot
 	applyCh     chan ApplyMsg
-	applyBuf    chan ApplyMsg
+	applyBuf    []ApplyMsg
 
 	retryc chan Message
 	recv   chan Message
@@ -117,7 +117,8 @@ type Raft struct {
 
 	stepFunc func(rf *Raft, msg Message)
 
-	mu sync.Mutex
+	mu   sync.Mutex
+	cond sync.Cond
 }
 
 // return currentTerm and whether this server
@@ -397,6 +398,7 @@ func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
 	close(rf.closeCh)
+	rf.cond.Broadcast()
 }
 
 func (rf *Raft) killed() bool {
@@ -440,6 +442,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.cond = *sync.NewCond(&sync.Mutex{})
 
 	rf.currentTerm = 0
 	rf.voteFor = None
@@ -454,7 +457,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.sn = nil
 	rf.applyCh = applyCh
-	rf.applyBuf = make(chan ApplyMsg, 256)
+	rf.applyBuf = []ApplyMsg{}
 
 	rf.recv = make(chan Message, 128)
 	rf.outc = make(chan Message, 128)
@@ -520,11 +523,21 @@ func (rf *Raft) out() {
 func (rf *Raft) apply() {
 	for {
 		select {
-		case apply := <-rf.applyBuf:
-			rf.applyCh <- apply
 		case <-rf.closeCh:
 			close(rf.applyCh)
 			return
+		default:
+			rf.cond.L.Lock()
+			for len(rf.applyBuf) == 0 {
+				rf.cond.Wait()
+			}
+			buf := rf.applyBuf
+			rf.applyBuf = []ApplyMsg{}
+			rf.cond.L.Unlock()
+
+			for _, msg := range buf {
+				rf.applyCh <- msg
+			}
 		}
 	}
 }
@@ -729,7 +742,7 @@ func (rf *Raft) step(msg Message) {
 		case DoSnapshot:
 			args := msg.Content.(SnapshotArgs)
 			// already do snapshot in that index
-			if args.LastIncludedIndex > rf.logs[0].Index {
+			if args.LastIncludedIndex > rf.lastApplied {
 				if args.LastIncludedIndex > rf.logs[len(rf.logs)-1].Index {
 					panic(fmt.Sprintf("server %v not has log in %v", rf.me, args.LastIncludedIndex))
 				}
@@ -846,12 +859,15 @@ func stepFollower(rf *Raft, msg Message) {
 	case InstallSnapshotRequest:
 		rf.resetElapsed()
 		args := msg.Content.(InstallSnapshotArgs)
-		rf.applyBuf <- ApplyMsg{
+		rf.cond.L.Lock()
+		rf.applyBuf = append(rf.applyBuf, ApplyMsg{
 			SnapshotValid: true,
 			Snapshot:      args.Data,
 			SnapshotTerm:  args.LastIncludedTerm,
 			SnapshotIndex: args.LastIncludedIndex,
-		}
+		})
+		rf.cond.Broadcast()
+		rf.cond.L.Unlock()
 		rf.sendMessage(Message{
 			Type: InstallSnapshotResponse,
 			Id:   msg.Id,
@@ -1180,6 +1196,7 @@ func (rf *Raft) commit(mayCommitIndex int) {
 	}
 	rf.commitIndex = mayCommitIndex
 	DPrintf("server %v commit index to %v", rf.me, rf.commitIndex)
+	rf.cond.L.Lock()
 	for rf.lastApplied < rf.commitIndex {
 		entry := rf.entryAt(rf.lastApplied + 1)
 		if entry.Index == None {
@@ -1187,13 +1204,16 @@ func (rf *Raft) commit(mayCommitIndex int) {
 				rf.me, rf.lastApplied+1, rf.logs[0].Term, rf.logs[0].Index,
 				rf.logs[len(rf.logs)-1].Term, rf.logs[len(rf.logs)-1].Index))
 		}
-		rf.applyBuf <- ApplyMsg{
+		rf.applyBuf = append(rf.applyBuf, ApplyMsg{
 			CommandValid: true,
 			Command:      entry.Command,
 			CommandIndex: entry.Index,
-		}
+		})
 		rf.lastApplied = entry.Index
 	}
+	rf.cond.Broadcast()
+	rf.cond.L.Unlock()
+
 }
 
 func (rf *Raft) conflict(index int) Entry {

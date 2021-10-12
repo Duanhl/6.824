@@ -13,7 +13,7 @@ import (
 
 const TickDuration = 10 * time.Millisecond
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -35,10 +35,11 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Type  OpType
-	Id    int32
-	Key   string
-	Value string
+	Type   OpType
+	Id     int32
+	Client int32
+	Key    string
+	Value  string
 }
 
 type KVServer struct {
@@ -52,11 +53,12 @@ type KVServer struct {
 
 	// Your definitions here.
 	store   map[string]string `store:"kv store"`
-	applied map[int32]int     `applied:"already applied request"`
+	applied map[int32]int32   `applied:"already applied request,key: clientId,value: requestId"`
 
 	closeCh       chan interface{} `closeCh:"notify close channel"`
 	activeTimeout int32
 	activeElapsed int32
+	waiting       int32
 
 	lastApplied int
 
@@ -64,8 +66,9 @@ type KVServer struct {
 }
 
 type Ctx struct {
-	id int32
-	ch chan Reply
+	id     int32
+	client int32
+	ch     chan Reply
 }
 
 func (kv *KVServer) process(op Op) chan Reply {
@@ -81,13 +84,16 @@ func (kv *KVServer) process(op Op) chan Reply {
 		// already start at (index)
 		if ctx, ok := kv.rpcm[index]; ok {
 			close(ctx.ch)
+			atomic.AddInt32(&kv.waiting, -1)
 		}
 
 		//DPrintf("KvSrv %v start op[%v] in index(%v)", kv.me, op.Id, index)
 		kv.rpcm[index] = Ctx{
-			id: op.Id,
-			ch: c,
+			id:     op.Id,
+			client: op.Client,
+			ch:     c,
 		}
+		atomic.AddInt32(&kv.waiting, 1)
 		return c
 	} else {
 		kv.clear()
@@ -99,9 +105,10 @@ func (kv *KVServer) process(op Op) chan Reply {
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	ch := kv.process(Op{
-		Type: GET,
-		Id:   args.Id,
-		Key:  args.Key,
+		Type:   GET,
+		Id:     args.Id,
+		Client: args.Client,
+		Key:    args.Key,
 	})
 	if r, ok := <-ch; ok {
 		reply.Err = r.Err
@@ -121,10 +128,11 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		ot = APPEND
 	}
 	ch := kv.process(Op{
-		Type:  ot,
-		Id:    args.Id,
-		Key:   args.Key,
-		Value: args.Value,
+		Type:   ot,
+		Id:     args.Id,
+		Client: args.Client,
+		Key:    args.Key,
+		Value:  args.Value,
 	})
 	if r, ok := <-ch; ok {
 		reply.Err = r.Err
@@ -186,21 +194,19 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.closeCh = make(chan interface{})
 
 	kv.store = make(map[string]string)
-	kv.applied = map[int32]int{}
+	kv.applied = map[int32]int32{}
 
-	kv.activeTimeout = 20
+	kv.activeTimeout = 10
 
 	kv.rpcm = map[int]Ctx{}
 
 	// You may need initialization code here.
 	sn := persister.ReadSnapshot()
 	if len(sn) > 0 {
-		kv.mu.Lock()
 		lastApplied, store, applied := kv.read(sn)
 		kv.lastApplied = lastApplied
 		kv.store = store
 		kv.applied = applied
-		kv.mu.Unlock()
 	}
 
 	go kv.run()
@@ -212,13 +218,14 @@ func (kv *KVServer) doReply(seq int, id int32, reply Reply) {
 	defer kv.mu.Unlock()
 
 	if ctx, ok := kv.rpcm[seq]; ok {
-		DPrintf("KvSrv %v replied op[%v]", kv.me, ctx.id)
+		DPrintf("KvSrv %v replied op[%v, %v]", kv.me, ctx.client, ctx.id)
 		if ctx.id == id {
 			ctx.ch <- reply
 		} else {
 			ctx.ch <- Reply{Err: ErrWrongLeader}
 		}
 		delete(kv.rpcm, seq)
+		atomic.AddInt32(&kv.waiting, -1)
 	}
 }
 
@@ -229,6 +236,7 @@ func (kv *KVServer) clear() {
 	for _, ctx := range kv.rpcm {
 		DPrintf("KvSrv %v clear op[%v] because leadership change", kv.me, ctx.id)
 		ctx.ch <- Reply{Err: ErrWrongLeader}
+		atomic.AddInt32(&kv.waiting, -1)
 	}
 	kv.rpcm = map[int]Ctx{}
 }
@@ -239,17 +247,14 @@ func (kv *KVServer) run() {
 	for {
 		select {
 		case <-ticker:
-			atomic.AddInt32(&kv.activeElapsed, 1)
-			if atomic.LoadInt32(&kv.activeElapsed) > kv.activeTimeout {
-				go func() {
-					atomic.StoreInt32(&kv.activeElapsed, 0)
-					if _, _, isLeader := kv.rf.Start(Op{Type: READINDEX}); !isLeader {
-						kv.clear()
-					}
-				}()
+			kv.activeElapsed++
+			if kv.activeElapsed > kv.activeTimeout && atomic.LoadInt32(&kv.waiting) > 0 {
+				if _, _, isLeader := kv.rf.Start(Op{Type: READINDEX}); !isLeader {
+					kv.clear()
+				}
 			}
 		case applyMsg := <-kv.applyCh:
-			atomic.StoreInt32(&kv.activeElapsed, 0)
+			kv.activeElapsed = 0
 			kv.doApply(applyMsg)
 		case <-kv.closeCh:
 			DPrintf("KvSrv %v closed", kv.me)
@@ -259,31 +264,25 @@ func (kv *KVServer) run() {
 }
 
 func (kv *KVServer) doApply(applyMsg raft.ApplyMsg) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
 	if applyMsg.CommandValid {
 		if applyMsg.CommandIndex != kv.lastApplied+1 {
 			DPrintf("ERROR, KvSrv %v applied index %v -> %v", kv.me, kv.lastApplied, applyMsg.CommandIndex)
 			return
 		}
 		op := applyMsg.Command.(Op)
-		value, err := kv.changeStore(applyMsg.CommandIndex, op)
-		go kv.doReply(applyMsg.CommandIndex, op.Id, Reply{
+		value, err := kv.changeStore(op)
+		kv.doReply(applyMsg.CommandIndex, op.Id, Reply{
 			Err:   err,
 			Value: value,
 		})
 		kv.lastApplied = applyMsg.CommandIndex
 		if kv.checkStateSize() {
 			// do snapshot
-			//go func() {
-			//	kv.mu.Lock()
 			data := kv.persists()
-			//kv.mu.Unlock()
-
-			DPrintf("KvSrv %v snapshot to index %v", kv.me, kv.lastApplied)
+			before := kv.rf.RaftStateSize()
 			kv.rf.Snapshot(kv.lastApplied, data)
-			//}()
+			after := kv.rf.RaftStateSize()
+			DPrintf("KvSrv %v snapshot to index %v, size: %v -> %v", kv.me, kv.lastApplied, before, after)
 		}
 		return
 	}
@@ -305,7 +304,7 @@ func (kv *KVServer) doApply(applyMsg raft.ApplyMsg) {
 	}
 }
 
-func (kv *KVServer) changeStore(seq int, op Op) (string, Err) {
+func (kv *KVServer) changeStore(op Op) (string, Err) {
 	switch op.Type {
 	case GET:
 		if v, ok := kv.store[op.Key]; ok {
@@ -313,18 +312,16 @@ func (kv *KVServer) changeStore(seq int, op Op) (string, Err) {
 		} else {
 			return "", ErrNoKey
 		}
-	case PUT:
-		if _, alreadyApplied := kv.applied[op.Id]; alreadyApplied == false {
-			kv.store[op.Key] = op.Value
-			kv.applied[op.Id] = seq
+	case PUT, APPEND:
+		maxApplied := kv.applied[op.Client]
+		if op.Id > maxApplied {
+			if op.Type == PUT {
+				kv.store[op.Key] = op.Value
+			} else {
+				kv.store[op.Key] += op.Value
+			}
 		}
-		return kv.store[op.Key], OK
-	case APPEND:
-		if _, alreadyApplied := kv.applied[op.Id]; alreadyApplied == false {
-			oldV := kv.store[op.Key]
-			kv.store[op.Key] = oldV + op.Value
-			kv.applied[op.Id] = seq
-		}
+		kv.applied[op.Client] = op.Id
 		return kv.store[op.Key], OK
 	case READINDEX:
 		return "", OK
@@ -337,31 +334,25 @@ func (kv *KVServer) checkStateSize() bool {
 	if kv.maxraftstate == -1 {
 		return false
 	}
-	return kv.rf.RaftStateSize() > 8*kv.maxraftstate
+	return kv.rf.RaftStateSize() > kv.maxraftstate
 }
 
 func (kv *KVServer) persists() []byte {
 	buf := new(bytes.Buffer)
 	e := labgob.NewEncoder(buf)
 
-	//applied := map[int64]int{}
-	//for id, seq := range kv.applied {
-	//	if seq >= kv.lastApplied - 10 {
-	//		applied[id] = seq
-	//	}
-	//}
 	e.Encode(&kv.lastApplied)
 	e.Encode(&kv.store)
 	e.Encode(&kv.applied)
 	return buf.Bytes()
 }
 
-func (kv *KVServer) read(data []byte) (int, map[string]string, map[int32]int) {
+func (kv *KVServer) read(data []byte) (int, map[string]string, map[int32]int32) {
 	buf := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(buf)
 	var lastApplied int
 	var store map[string]string
-	var applied map[int32]int
+	var applied map[int32]int32
 
 	if d.Decode(&lastApplied) != nil ||
 		d.Decode(&store) != nil ||

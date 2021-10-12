@@ -4,6 +4,7 @@ import (
 	"6.824/labrpc"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 import "crypto/rand"
@@ -13,6 +14,8 @@ type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 	mu      sync.Mutex
+	id      int32
+	seq     int32
 	healthy []int
 }
 
@@ -31,6 +34,8 @@ func sleepRandom(base int64) {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
+	ck.id = int32(nrand())
+	ck.seq = 0
 	// You'll have to add code here.
 	ck.healthy = make([]int, len(ck.servers))
 	for i := 0; i < len(ck.healthy); i++ {
@@ -56,8 +61,9 @@ func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
 loop:
 	args := &GetArgs{
-		Key: key,
-		Id:  int32(nrand()),
+		Key:    key,
+		Client: ck.id,
+		Id:     atomic.AddInt32(&ck.seq, 1),
 	}
 	reply := &GetReply{}
 	i := ck.availableServer()
@@ -72,7 +78,7 @@ loop:
 	ck.healthy[i]++
 	ck.mu.Unlock()
 
-	sleepRandom(30)
+	sleepRandom(50)
 
 	goto loop
 }
@@ -106,10 +112,11 @@ func (ck *Clerk) availableServer() int {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	args := &PutAppendArgs{
-		Op:    op,
-		Key:   key,
-		Value: value,
-		Id:    int32(nrand()),
+		Op:     op,
+		Key:    key,
+		Value:  value,
+		Client: ck.id,
+		Id:     atomic.AddInt32(&ck.seq, 1),
 	}
 loop:
 	reply := &PutAppendReply{}
