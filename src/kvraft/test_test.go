@@ -2,8 +2,6 @@ package kvraft
 
 import (
 	"6.824/porcupine"
-	"log"
-	"net/http"
 )
 import "6.824/models"
 import "testing"
@@ -209,10 +207,6 @@ func partitioner(t *testing.T, cfg *config, ch chan bool, done *int32) {
 // size) shouldn't exceed 8*maxraftstate. If maxraftstate is negative,
 // snapshots shouldn't be used.
 func GenericTest(t *testing.T, part string, nclients int, nservers int, unreliable bool, crash bool, partitions bool, maxraftstate int, randomkeys bool) {
-
-	go func() {
-		log.Panicln(http.ListenAndServe("localhost:6060", nil))
-	}()
 
 	title := "Test: "
 	if unreliable {
@@ -601,6 +595,11 @@ func TestPersistPartitionUnreliableLinearizable3A(t *testing.T) {
 // even if minority doesn't respond.
 //
 func TestSnapshotRPC3B(t *testing.T) {
+
+	//go func() {
+	//	log.Panicln(http.ListenAndServe("localhost:6060", nil))
+	//}()
+
 	const nservers = 3
 	maxraftstate := 1000
 	cfg := make_config(t, nservers, false, maxraftstate)
@@ -657,7 +656,7 @@ func TestSnapshotRPC3B(t *testing.T) {
 
 // are the snapshots not too huge? 500 bytes is a generous bound for the
 // operations we're doing here.
-func TestSnapshotSize3B(t *testing.T) {
+func TestSnapshotSize4B(t *testing.T) {
 	const nservers = 3
 	maxraftstate := 1000
 	maxsnapshotstate := 500

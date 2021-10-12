@@ -454,7 +454,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.sn = nil
 	rf.applyCh = applyCh
-	rf.applyBuf = make(chan ApplyMsg, 16)
+	rf.applyBuf = make(chan ApplyMsg, 256)
 
 	rf.recv = make(chan Message, 128)
 	rf.outc = make(chan Message, 128)
@@ -744,7 +744,7 @@ func (rf *Raft) step(msg Message) {
 
 		case CondInstallSnapshot:
 			args := msg.Content.(SnapshotArgs)
-			if args.LastIncludedIndex > rf.logs[0].Index {
+			if args.LastIncludedIndex > rf.commitIndex {
 				rf.doSnapshot(args.LastIncludedIndex, args.LastIncludedTerm, args.Snapshot)
 				rf.sendMessage(Message{
 					Type:    DoSnapshot,

@@ -4,6 +4,7 @@ import (
 	"6.824/labrpc"
 	"math"
 	"sync"
+	"time"
 )
 import "crypto/rand"
 import "math/big"
@@ -20,6 +21,11 @@ func nrand() int64 {
 	bigx, _ := rand.Int(rand.Reader, max)
 	x := bigx.Int64()
 	return x
+}
+
+func sleepRandom(base int64) {
+	duration := time.Duration(base) + time.Duration(nrand()%base)
+	time.Sleep(duration * time.Millisecond)
 }
 
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
@@ -51,7 +57,7 @@ func (ck *Clerk) Get(key string) string {
 loop:
 	args := &GetArgs{
 		Key: key,
-		Id:  nrand(),
+		Id:  int32(nrand()),
 	}
 	reply := &GetReply{}
 	i := ck.availableServer()
@@ -65,6 +71,8 @@ loop:
 	ck.mu.Lock()
 	ck.healthy[i]++
 	ck.mu.Unlock()
+
+	sleepRandom(30)
 
 	goto loop
 }
@@ -101,7 +109,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Op:    op,
 		Key:   key,
 		Value: value,
-		Id:    nrand(),
+		Id:    int32(nrand()),
 	}
 loop:
 	reply := &PutAppendReply{}
@@ -115,6 +123,8 @@ loop:
 	ck.mu.Lock()
 	ck.healthy[i]++
 	ck.mu.Unlock()
+
+	sleepRandom(30)
 
 	goto loop
 }

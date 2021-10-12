@@ -4,15 +4,16 @@ import (
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-const Debug = true
+const TickDuration = 10 * time.Millisecond
 
-const TickDuration = 50 * time.Millisecond
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -35,7 +36,7 @@ type Op struct {
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 	Type  OpType
-	Id    int64
+	Id    int32
 	Key   string
 	Value string
 }
@@ -51,43 +52,53 @@ type KVServer struct {
 
 	// Your definitions here.
 	store   map[string]string `store:"kv store"`
-	opCh    chan Op           `opCh:"input request channel"`
-	closeCh chan interface{}  `closeCh:"notify close channel"`
-	ticker  chan interface{}  `ticker:"for periodicity check raft peer state or call readIndex"`
+	applied map[int32]int     `applied:"already applied request"`
 
-	applied   map[int64]bool
-	requested map[int64]bool
+	closeCh       chan interface{} `closeCh:"notify close channel"`
+	activeTimeout int32
+	activeElapsed int32
 
-	rpcm map[int64]chan Reply
+	lastApplied int
+
+	rpcm map[int]Ctx
 }
 
-func (kv *KVServer) register(op Op) chan Reply {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
+type Ctx struct {
+	id int32
+	ch chan Reply
+}
 
+func (kv *KVServer) process(op Op) chan Reply {
 	c := make(chan Reply)
 	if kv.killed() {
 		close(c)
 		return c
 	}
 
-	// already applied, only for PUT/APPEND
-	if _, ok := kv.applied[op.Id]; ok {
-		go func() { c <- Reply{Err: OK} }()
-	} else if _, ok := kv.requested[op.Id]; ok {
-		oldC := kv.rpcm[op.Id]
-		close(oldC)
-		kv.rpcm[op.Id] = c
+	if index, _, isLeader := kv.rf.Start(op); isLeader {
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
+		// already start at (index)
+		if ctx, ok := kv.rpcm[index]; ok {
+			close(ctx.ch)
+		}
+
+		//DPrintf("KvSrv %v start op[%v] in index(%v)", kv.me, op.Id, index)
+		kv.rpcm[index] = Ctx{
+			id: op.Id,
+			ch: c,
+		}
+		return c
 	} else {
-		kv.rpcm[op.Id] = c
-		kv.opCh <- op
+		kv.clear()
+		close(c)
+		return c
 	}
-	return c
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	ch := kv.register(Op{
+	ch := kv.process(Op{
 		Type: GET,
 		Id:   args.Id,
 		Key:  args.Key,
@@ -109,7 +120,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	} else {
 		ot = APPEND
 	}
-	ch := kv.register(Op{
+	ch := kv.process(Op{
 		Type:  ot,
 		Id:    args.Id,
 		Key:   args.Key,
@@ -172,126 +183,190 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	kv.opCh = make(chan Op)
 	kv.closeCh = make(chan interface{})
 
-	kv.ticker = make(chan interface{}, 32)
-	go func() {
-		ticker := time.Tick(TickDuration)
-		for kv.killed() == false {
-			select {
-			case <-ticker:
-				kv.ticker <- struct{}{}
-			}
-		}
-		ticker = nil
-	}()
-
 	kv.store = make(map[string]string)
-	kv.applied = map[int64]bool{}
-	kv.requested = map[int64]bool{}
+	kv.applied = map[int32]int{}
 
-	kv.rpcm = map[int64]chan Reply{}
+	kv.activeTimeout = 20
+
+	kv.rpcm = map[int]Ctx{}
 
 	// You may need initialization code here.
-	go kv.run()
+	sn := persister.ReadSnapshot()
+	if len(sn) > 0 {
+		kv.mu.Lock()
+		lastApplied, store, applied := kv.read(sn)
+		kv.lastApplied = lastApplied
+		kv.store = store
+		kv.applied = applied
+		kv.mu.Unlock()
+	}
 
+	go kv.run()
 	return kv
 }
 
+func (kv *KVServer) doReply(seq int, id int32, reply Reply) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if ctx, ok := kv.rpcm[seq]; ok {
+		DPrintf("KvSrv %v replied op[%v]", kv.me, ctx.id)
+		if ctx.id == id {
+			ctx.ch <- reply
+		} else {
+			ctx.ch <- Reply{Err: ErrWrongLeader}
+		}
+		delete(kv.rpcm, seq)
+	}
+}
+
+func (kv *KVServer) clear() {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	for _, ctx := range kv.rpcm {
+		DPrintf("KvSrv %v clear op[%v] because leadership change", kv.me, ctx.id)
+		ctx.ch <- Reply{Err: ErrWrongLeader}
+	}
+	kv.rpcm = map[int]Ctx{}
+}
+
 func (kv *KVServer) run() {
+	DPrintf("KvSrv %v start", kv.me)
+	ticker := time.Tick(TickDuration)
 	for {
 		select {
+		case <-ticker:
+			atomic.AddInt32(&kv.activeElapsed, 1)
+			if atomic.LoadInt32(&kv.activeElapsed) > kv.activeTimeout {
+				go func() {
+					atomic.StoreInt32(&kv.activeElapsed, 0)
+					if _, _, isLeader := kv.rf.Start(Op{Type: READINDEX}); !isLeader {
+						kv.clear()
+					}
+				}()
+			}
 		case applyMsg := <-kv.applyCh:
-			kv.apply(applyMsg)
-		case op := <-kv.opCh:
-			kv.process(op)
-		case <-kv.ticker:
-			kv.tick()
+			atomic.StoreInt32(&kv.activeElapsed, 0)
+			kv.doApply(applyMsg)
 		case <-kv.closeCh:
+			DPrintf("KvSrv %v closed", kv.me)
 			return
 		}
 	}
 }
 
-func (kv *KVServer) apply(applyMsg raft.ApplyMsg) {
-	op := applyMsg.Command.(Op)
-
+func (kv *KVServer) doApply(applyMsg raft.ApplyMsg) {
 	kv.mu.Lock()
-	ch, needRespond := kv.rpcm[op.Id]
-	delete(kv.rpcm, op.Id)
-	kv.mu.Unlock()
+	defer kv.mu.Unlock()
 
-	switch op.Type {
-	case GET:
-		if needRespond {
-			if v, ok := kv.store[op.Key]; ok {
-				ch <- Reply{
-					Err:   OK,
-					Value: v,
-				}
-			} else {
-				ch <- Reply{
-					Err: ErrNoKey,
-				}
+	if applyMsg.CommandValid {
+		if applyMsg.CommandIndex != kv.lastApplied+1 {
+			DPrintf("ERROR, KvSrv %v applied index %v -> %v", kv.me, kv.lastApplied, applyMsg.CommandIndex)
+			return
+		}
+		op := applyMsg.Command.(Op)
+		value, err := kv.changeStore(applyMsg.CommandIndex, op)
+		go kv.doReply(applyMsg.CommandIndex, op.Id, Reply{
+			Err:   err,
+			Value: value,
+		})
+		kv.lastApplied = applyMsg.CommandIndex
+		if kv.checkStateSize() {
+			// do snapshot
+			//go func() {
+			//	kv.mu.Lock()
+			data := kv.persists()
+			//kv.mu.Unlock()
+
+			DPrintf("KvSrv %v snapshot to index %v", kv.me, kv.lastApplied)
+			kv.rf.Snapshot(kv.lastApplied, data)
+			//}()
+		}
+		return
+	}
+
+	if applyMsg.SnapshotValid {
+		if kv.rf.CondInstallSnapshot(applyMsg.SnapshotTerm, applyMsg.SnapshotIndex, applyMsg.Snapshot) {
+			DPrintf("KvSrv %v install snapshot, index %v -> %v", kv.me, kv.lastApplied, applyMsg.SnapshotIndex)
+			lastApplied, store, applied := kv.read(applyMsg.Snapshot)
+			kv.lastApplied = lastApplied
+			kv.store = store
+			kv.applied = applied
+
+			for seq, ctx := range kv.rpcm {
+				DPrintf("KvSrv %v install snapshot and clear op[%v]", kv.me, ctx.id)
+				ctx.ch <- Reply{Err: ErrWrongLeader}
+				delete(kv.rpcm, seq)
 			}
 		}
-		break
+	}
+}
+
+func (kv *KVServer) changeStore(seq int, op Op) (string, Err) {
+	switch op.Type {
+	case GET:
+		if v, ok := kv.store[op.Key]; ok {
+			return v, OK
+		} else {
+			return "", ErrNoKey
+		}
 	case PUT:
 		if _, alreadyApplied := kv.applied[op.Id]; alreadyApplied == false {
 			kv.store[op.Key] = op.Value
-			kv.applied[op.Id] = true
+			kv.applied[op.Id] = seq
 		}
-		if needRespond {
-			ch <- Reply{
-				Err: OK,
-			}
-		}
-		break
+		return kv.store[op.Key], OK
 	case APPEND:
 		if _, alreadyApplied := kv.applied[op.Id]; alreadyApplied == false {
 			oldV := kv.store[op.Key]
 			kv.store[op.Key] = oldV + op.Value
-			kv.applied[op.Id] = true
+			kv.applied[op.Id] = seq
 		}
-		if needRespond {
-			ch <- Reply{
-				Err: OK,
-			}
-		}
-		break
-	}
-}
-
-func (kv *KVServer) tick() {
-	_, isLeader := kv.rf.GetState()
-	// raft state change, return all uncommited request
-	if isLeader == false {
-		kv.handleStateChange()
-	}
-}
-
-func (kv *KVServer) process(op Op) {
-	_, _, isLeader := kv.rf.Start(op)
-	if isLeader == false {
-		kv.handleStateChange()
-	}
-}
-
-func (kv *KVServer) handleStateChange() {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
-	for id, _ := range kv.rpcm {
-		ch := kv.rpcm[id]
-		ch <- Reply{
-			Err: ErrWrongLeader,
-		}
-		delete(kv.rpcm, id)
+		return kv.store[op.Key], OK
+	case READINDEX:
+		return "", OK
+	default:
+		panic("Unsupported op type")
 	}
 }
 
 func (kv *KVServer) checkStateSize() bool {
-	return false
-	//return kv.rf.RaftStateSize() > kv.maxraftstate
+	if kv.maxraftstate == -1 {
+		return false
+	}
+	return kv.rf.RaftStateSize() > 8*kv.maxraftstate
+}
+
+func (kv *KVServer) persists() []byte {
+	buf := new(bytes.Buffer)
+	e := labgob.NewEncoder(buf)
+
+	//applied := map[int64]int{}
+	//for id, seq := range kv.applied {
+	//	if seq >= kv.lastApplied - 10 {
+	//		applied[id] = seq
+	//	}
+	//}
+	e.Encode(&kv.lastApplied)
+	e.Encode(&kv.store)
+	e.Encode(&kv.applied)
+	return buf.Bytes()
+}
+
+func (kv *KVServer) read(data []byte) (int, map[string]string, map[int32]int) {
+	buf := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(buf)
+	var lastApplied int
+	var store map[string]string
+	var applied map[int32]int
+
+	if d.Decode(&lastApplied) != nil ||
+		d.Decode(&store) != nil ||
+		d.Decode(&applied) != nil {
+		panic("Decode data error")
+	}
+	return lastApplied, store, applied
 }
