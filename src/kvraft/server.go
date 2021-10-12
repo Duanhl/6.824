@@ -11,9 +11,9 @@ import (
 	"time"
 )
 
-const TickDuration = 10 * time.Millisecond
+const TickDuration = 20 * time.Millisecond
 
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -196,7 +196,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.store = make(map[string]string)
 	kv.applied = map[int32]int32{}
 
-	kv.activeTimeout = 10
+	kv.activeTimeout = 5
 
 	kv.rpcm = map[int]Ctx{}
 
@@ -242,7 +242,6 @@ func (kv *KVServer) clear() {
 }
 
 func (kv *KVServer) run() {
-	DPrintf("KvSrv %v start", kv.me)
 	ticker := time.Tick(TickDuration)
 	for {
 		select {
@@ -257,7 +256,6 @@ func (kv *KVServer) run() {
 			kv.activeElapsed = 0
 			kv.doApply(applyMsg)
 		case <-kv.closeCh:
-			DPrintf("KvSrv %v closed", kv.me)
 			return
 		}
 	}
@@ -279,10 +277,8 @@ func (kv *KVServer) doApply(applyMsg raft.ApplyMsg) {
 		if kv.checkStateSize() {
 			// do snapshot
 			data := kv.persists()
-			before := kv.rf.RaftStateSize()
 			kv.rf.Snapshot(kv.lastApplied, data)
-			after := kv.rf.RaftStateSize()
-			DPrintf("KvSrv %v snapshot to index %v, size: %v -> %v", kv.me, kv.lastApplied, before, after)
+			DPrintf("KvSrv %v snapshot to index %v", kv.me, kv.lastApplied)
 		}
 		return
 	}
@@ -295,11 +291,7 @@ func (kv *KVServer) doApply(applyMsg raft.ApplyMsg) {
 			kv.store = store
 			kv.applied = applied
 
-			for seq, ctx := range kv.rpcm {
-				DPrintf("KvSrv %v install snapshot and clear op[%v]", kv.me, ctx.id)
-				ctx.ch <- Reply{Err: ErrWrongLeader}
-				delete(kv.rpcm, seq)
-			}
+			kv.clear()
 		}
 	}
 }

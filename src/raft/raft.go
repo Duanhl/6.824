@@ -397,8 +397,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	close(rf.closeCh)
-	rf.cond.Broadcast()
 }
 
 func (rf *Raft) killed() bool {
@@ -495,6 +493,8 @@ func (rf *Raft) run() {
 			}
 		}
 	}
+	close(rf.closeCh)
+	rf.cond.Signal()
 	rf.clear()
 }
 
@@ -742,7 +742,7 @@ func (rf *Raft) step(msg Message) {
 		case DoSnapshot:
 			args := msg.Content.(SnapshotArgs)
 			// already do snapshot in that index
-			if args.LastIncludedIndex > rf.lastApplied {
+			if args.LastIncludedIndex > rf.logs[0].Index {
 				if args.LastIncludedIndex > rf.logs[len(rf.logs)-1].Index {
 					panic(fmt.Sprintf("server %v not has log in %v", rf.me, args.LastIncludedIndex))
 				}
@@ -757,7 +757,7 @@ func (rf *Raft) step(msg Message) {
 
 		case CondInstallSnapshot:
 			args := msg.Content.(SnapshotArgs)
-			if args.LastIncludedIndex > rf.commitIndex {
+			if args.LastIncludedIndex > rf.lastApplied {
 				rf.doSnapshot(args.LastIncludedIndex, args.LastIncludedTerm, args.Snapshot)
 				rf.sendMessage(Message{
 					Type:    DoSnapshot,
@@ -866,7 +866,7 @@ func stepFollower(rf *Raft, msg Message) {
 			SnapshotTerm:  args.LastIncludedTerm,
 			SnapshotIndex: args.LastIncludedIndex,
 		})
-		rf.cond.Broadcast()
+		rf.cond.Signal()
 		rf.cond.L.Unlock()
 		rf.sendMessage(Message{
 			Type: InstallSnapshotResponse,
@@ -1211,7 +1211,7 @@ func (rf *Raft) commit(mayCommitIndex int) {
 		})
 		rf.lastApplied = entry.Index
 	}
-	rf.cond.Broadcast()
+	rf.cond.Signal()
 	rf.cond.L.Unlock()
 
 }
