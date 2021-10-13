@@ -2,7 +2,6 @@ package kvraft
 
 import (
 	"6.824/labrpc"
-	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,10 +12,10 @@ import "math/big"
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
-	mu      sync.Mutex
-	id      int32
-	seq     int32
-	healthy []int
+	mu     sync.Mutex
+	id     int32
+	seq    int32
+	leader int
 }
 
 func nrand() int64 {
@@ -37,10 +36,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.id = int32(nrand())
 	ck.seq = 0
 	// You'll have to add code here.
-	ck.healthy = make([]int, len(ck.servers))
-	for i := 0; i < len(ck.healthy); i++ {
-		ck.healthy[i] = 1
-	}
+	ck.leader = int(nrand()) % len(servers)
 	return ck
 }
 
@@ -66,37 +62,22 @@ loop:
 		Id:     atomic.AddInt32(&ck.seq, 1),
 	}
 	reply := &GetReply{}
-	i := ck.availableServer()
-	if ok := ck.servers[i].Call("KVServer.Get", args, reply); ok {
-		if reply.Err == OK {
-			return reply.Value
-		} else if reply.Err == ErrNoKey {
-			return ""
+	servers := ck.loop()
+	for _, i := range servers {
+		if ok := ck.servers[i].Call("KVServer.Get", args, reply); ok {
+			if reply.Err == OK {
+				ck.setLeader(i)
+				return reply.Value
+			} else if reply.Err == ErrNoKey {
+				ck.setLeader(i)
+				return ""
+			}
 		}
 	}
-	ck.mu.Lock()
-	ck.healthy[i]++
-	ck.mu.Unlock()
 
 	sleepRandom(50)
 
 	goto loop
-}
-
-func (ck *Clerk) availableServer() int {
-	ck.mu.Lock()
-	defer ck.mu.Unlock()
-
-	server := None
-	m := math.MaxInt32
-
-	for i := 0; i < len(ck.servers); i++ {
-		if ck.healthy[i] < m {
-			m = ck.healthy[i]
-			server = i
-		}
-	}
-	return server
 }
 
 //
@@ -120,18 +101,17 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	}
 loop:
 	reply := &PutAppendReply{}
-	i := ck.availableServer()
-	if ok := ck.servers[i].Call("KVServer.PutAppend", args, reply); ok {
-		if reply.Err == OK {
-			return
+	servers := ck.loop()
+	for _, i := range servers {
+		if ok := ck.servers[i].Call("KVServer.PutAppend", args, reply); ok {
+			if reply.Err == OK {
+				ck.setLeader(i)
+				return
+			}
 		}
 	}
 
-	ck.mu.Lock()
-	ck.healthy[i]++
-	ck.mu.Unlock()
-
-	sleepRandom(30)
+	sleepRandom(50)
 
 	goto loop
 }
@@ -141,4 +121,22 @@ func (ck *Clerk) Put(key string, value string) {
 }
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
+}
+
+func (ck *Clerk) loop() []int {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+
+	var res []int
+	for i := ck.leader; i < ck.leader+len(ck.servers); i++ {
+		res = append(res, i%len(ck.servers))
+	}
+	return res
+}
+
+func (ck *Clerk) setLeader(server int) {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+
+	ck.leader = server
 }

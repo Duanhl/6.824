@@ -79,6 +79,7 @@ func (kv *KVServer) process(op Op) chan Reply {
 	}
 
 	if index, _, isLeader := kv.rf.Start(op); isLeader {
+		DPrintf("KvSrv %v start op[(%v, %v), %v, %v, %v] in index: %v", kv.me, op.Client, op.Id, op.Type, op.Key, op.Value, index)
 		kv.mu.Lock()
 		defer kv.mu.Unlock()
 		// already start at (index)
@@ -213,13 +214,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	return kv
 }
 
-func (kv *KVServer) doReply(seq int, id int32, reply Reply) {
+func (kv *KVServer) doReply(seq int, client int32, id int32, reply Reply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
 	if ctx, ok := kv.rpcm[seq]; ok {
-		DPrintf("KvSrv %v replied op[%v, %v]", kv.me, ctx.client, ctx.id)
-		if ctx.id == id {
+		DPrintf("KvSrv %v replied op[%v, %v, %v]", kv.me, ctx.client, ctx.id, reply.Err)
+		if ctx.id == id && ctx.client == client {
 			ctx.ch <- reply
 		} else {
 			ctx.ch <- Reply{Err: ErrWrongLeader}
@@ -234,7 +235,7 @@ func (kv *KVServer) clear() {
 	defer kv.mu.Unlock()
 
 	for _, ctx := range kv.rpcm {
-		DPrintf("KvSrv %v clear op[%v] because leadership change", kv.me, ctx.id)
+		DPrintf("KvSrv %v clear op[%v, %v] because leadership change", kv.me, ctx.client, ctx.id)
 		ctx.ch <- Reply{Err: ErrWrongLeader}
 		atomic.AddInt32(&kv.waiting, -1)
 	}
@@ -269,7 +270,7 @@ func (kv *KVServer) doApply(applyMsg raft.ApplyMsg) {
 		}
 		op := applyMsg.Command.(Op)
 		value, err := kv.changeStore(op)
-		kv.doReply(applyMsg.CommandIndex, op.Id, Reply{
+		kv.doReply(applyMsg.CommandIndex, op.Client, op.Id, Reply{
 			Err:   err,
 			Value: value,
 		})
