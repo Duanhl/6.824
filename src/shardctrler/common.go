@@ -29,7 +29,8 @@ type Config struct {
 }
 
 const (
-	OK = "OK"
+	OK            = "OK"
+	NumOutOfIndex = "NumOutOfIndex"
 )
 
 type Err string
@@ -70,4 +71,13 @@ type QueryReply struct {
 	WrongLeader bool
 	Err         Err
 	Config      Config
+}
+
+func Find(arr []int, target int) bool {
+	for _, x := range arr {
+		if target == x {
+			return true
+		}
+	}
+	return false
 }
