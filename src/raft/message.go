@@ -2,7 +2,7 @@ package raft
 
 import (
 	"encoding/json"
-	"strconv"
+	"log"
 )
 
 type MessageType int32
@@ -47,20 +47,29 @@ type Message struct {
 	From int         "what peer the message from"
 	To   int         "what peer the message will sent"
 
-	Term    int         "message term"
-	Content interface{} "message body"
+	LastLogIndex int
+	LastLogTerm  int
+	LeaderCommit int
+	Entries      []Entry
+	Snapshot     []byte
+
+	Val interface{}
+
+	Term    int "message term"
+	Success bool
+
+	replyC chan Message
 }
 
-func (m Message) String() string {
-	js := "\n{\n  type:" + m.Type.String() + ",\n"
-	js += "  from:" + strconv.Itoa(m.From) + ",\n"
-	js += "  to:" + strconv.Itoa(m.To) + ",\n"
-	if b, err := json.Marshal(m.Content); err == nil {
-		js += "  content:" + string(b) + "\n}"
-	} else {
-		js += "  content: nil \n}"
+func (m *Message) String() string {
+	str := MessageTypeMap[m.Type] + "["
+	b, err := json.Marshal(m)
+	if err != nil {
+		log.Fatalln(err)
 	}
-	return js
+	str += string(b)
+	str += "]"
+	return str
 }
 
 // for getState
