@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -82,8 +83,9 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
-	recv chan Message
-	tc   chan interface{}
+	recv chan Message     // local call, rpc handle, rpc response handle
+	errC chan Message     // rpc call failed handle
+	tc   chan interface{} // lock event handle
 
 	// local lock
 	elapsed  int
@@ -149,8 +151,15 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
-
-	return true
+	ch := make(chan Message)
+	rf.recv <- Message{
+		Type:         CondInstallSnapshot,
+		LastLogIndex: lastIncludedIndex,
+		LastLogTerm:  lastIncludedTerm,
+		Snapshot:     snapshot,
+		replyC:       ch,
+	}
+	return (<-ch).Success
 }
 
 // the service says it has created a snapshot that has
@@ -159,7 +168,14 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-
+	ch := make(chan Message)
+	rf.recv <- Message{
+		Type:         DoSnapshot,
+		LastLogIndex: index,
+		Snapshot:     snapshot,
+		replyC:       ch,
+	}
+	<-ch
 }
 
 //
@@ -168,6 +184,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -176,6 +196,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -183,6 +205,18 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	ch := make(chan Message)
+	rf.recv <- Message{
+		Type:         VoteRequest,
+		From:         args.CandidateId,
+		LastLogIndex: args.LastLogIndex,
+		LastLogTerm:  args.LastLogTerm,
+		Term:         args.Term,
+		replyC:       ch,
+	}
+	msg := <-ch
+	reply.Term = msg.Term
+	reply.VoteGranted = msg.Success
 }
 
 //
@@ -217,6 +251,117 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
+}
+
+func (rf *Raft) requestVoteLoop(server int) {
+	lastEntry, _ := rf.rsm.LastEntry()
+	arg := &RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: lastEntry.Index,
+		LastLogTerm:  lastEntry.Term,
+	}
+	reply := &RequestVoteReply{}
+	go func() {
+		ok := rf.sendRequestVote(server, arg, reply)
+		if ok {
+			rf.recv <- Message{
+				Type:    VoteResponse,
+				From:    server,
+				Term:    reply.Term,
+				Success: reply.VoteGranted,
+			}
+		} else {
+			rf.errC <- Message{
+				Type: VoteRequest,
+				To:   server,
+				Term: arg.Term,
+			}
+		}
+	}()
+}
+
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []Entry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	ch := make(chan Message)
+	rf.recv <- Message{
+		Type:         AppendRequest,
+		From:         args.LeaderId,
+		LastLogIndex: args.PrevLogIndex,
+		LastLogTerm:  args.PrevLogTerm,
+		Term:         args.Term,
+		Entries:      args.Entries,
+		LeaderCommit: args.LeaderCommit,
+		replyC:       ch,
+	}
+	msg := <-ch
+	reply.Term = msg.Term
+	reply.Success = msg.Success
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) appendEntriesLoop(server int) {
+	entries, prevIndex, prevTerm, err := rf.rsm.EntryFrom(rf.nextIndex[server])
+	if err != nil {
+		lastEntry, _ := rf.rsm.LastEntry()
+		log.Fatalf("%v, %v, %v", rf.nextIndex[server], lastEntry.Term, lastEntry.Index)
+	}
+	var replicaLastIndex int
+	var replicaLastTerm int
+	if len(entries) == 0 {
+		replicaLastIndex = prevIndex
+		replicaLastTerm = prevTerm
+	} else {
+		replicaLastIndex = entries[len(entries)-1].Index
+		replicaLastTerm = entries[len(entries)-1].Term
+	}
+	args := &AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevIndex,
+		PrevLogTerm:  prevTerm,
+		Entries:      entries,
+		LeaderCommit: rf.rsm.CommitIndex(),
+	}
+	reply := &AppendEntriesReply{}
+	go func() {
+		ok := rf.sendAppendEntries(server, args, reply)
+		if ok {
+			rf.recv <- Message{
+				Type:         AppendResponse,
+				From:         server,
+				Term:         reply.Term,
+				LastLogIndex: replicaLastIndex,
+				LastLogTerm:  replicaLastTerm,
+				Success:      reply.Success,
+			}
+		} else {
+			rf.recv <- Message{
+				Type:         AppendRequest,
+				To:           server,
+				Term:         args.Term,
+				LastLogIndex: replicaLastIndex,
+				LastLogTerm:  replicaLastTerm,
+			}
+		}
+	}()
 }
 
 //
@@ -291,6 +436,8 @@ func (rf *Raft) mainLoop() {
 			rf.handleTick()
 		case msg := <-rf.recv:
 			rf.stepMessage(msg)
+		case msg := <-rf.errC:
+			rf.handleError(msg)
 		}
 	}
 }
@@ -298,7 +445,7 @@ func (rf *Raft) mainLoop() {
 func (rf *Raft) stepMessage(msg Message) {
 	// local message
 	if msg.Term == -1 {
-
+		rf.stepLocalMessage(msg)
 		return
 	}
 
@@ -358,6 +505,27 @@ func (rf *Raft) reject(msg Message) {
 		msg.replyC <- Message{
 			Term:    rf.currentTerm,
 			Success: false,
+		}
+	}
+}
+
+func (rf *Raft) handleError(msg Message) {
+	if msg.Term == rf.currentTerm {
+		if msg.Type == VoteRequest && rf.state == Candidate {
+			rf.requestVoteLoop(msg.To)
+		}
+		if msg.Type == AppendRequest && rf.state == Leader {
+			var lastEntryIndex int
+			if len(msg.Entries) == 0 {
+				lastEntryIndex = msg.LastLogIndex
+			} else {
+				lastEntryIndex = msg.Entries[len(msg.Entries)-1].Index
+			}
+			lastEntry, _ := rf.rsm.LastEntry()
+			// no command during call
+			if lastEntryIndex == lastEntry.Index {
+				rf.appendEntriesLoop(msg.To)
+			}
 		}
 	}
 }

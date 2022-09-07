@@ -18,6 +18,7 @@ type HardRsm struct {
 	committed int
 	applied   int
 	logs      []Entry // always start with a dummy entry
+	sn        []byte
 }
 
 var IndexOutBoundError = errors.New("index out of bound")
@@ -33,6 +34,31 @@ func (rsm *Rsm) EntryAt(index int) (Entry, error) {
 	}
 	startIndex := rsm.logs[0].Index
 	return rsm.logs[index-startIndex], nil
+}
+
+func (rsm *Rsm) EntryFrom(index int) ([]Entry, int, int, error) {
+	rsm.mu.Lock()
+	defer rsm.mu.Unlock()
+
+	if index <= rsm.logs[0].Index || index > rsm.logs[len(rsm.logs)-1].Index {
+		return nil, -1, -1, IndexOutBoundError
+	}
+	lastEntry, _ := rsm.LastEntry()
+	if index == lastEntry.Index {
+		return nil, lastEntry.Term, lastEntry.Index, nil
+	} else {
+		entries := rsm.logs[index-rsm.logs[0].Index:]
+		prevEntry := rsm.logs[index-rsm.logs[0].Index-1]
+		return entries, prevEntry.Term, prevEntry.Index, nil
+	}
+}
+
+func (rsm *Rsm) hasUncommitted() bool {
+	rsm.mu.Lock()
+	defer rsm.mu.Unlock()
+
+	lastEntry, _ := rsm.LastEntry()
+	return lastEntry.Index > rsm.committed
 }
 
 func (rsm *Rsm) CommitIndex() int {
@@ -69,7 +95,7 @@ func (rsm *Rsm) Drop(index int) error {
 
 // forgotten log entries until given index, only applied entry
 // can forgotten
-func (rsm *Rsm) Forgotten(index int) error {
+func (rsm *Rsm) Forgotten(index int, sn []byte) error {
 	rsm.mu.Lock()
 	defer rsm.mu.Unlock()
 
@@ -79,6 +105,7 @@ func (rsm *Rsm) Forgotten(index int) error {
 
 	startIndex := index - rsm.logs[0].Index
 	rsm.logs = rsm.logs[startIndex:]
+	rsm.sn = sn
 	return nil
 }
 
@@ -160,5 +187,6 @@ func (rsm *Rsm) getState() HardRsm {
 		committed: rsm.committed,
 		applied:   rsm.applied,
 		logs:      rsm.logs,
+		sn:        rsm.sn,
 	}
 }
