@@ -72,29 +72,15 @@ func (m *Message) String() string {
 	return str
 }
 
-// for getState
-type StateInfo struct {
-	Term     int
-	IsLeader bool
-}
-
-// for start req
-type StartInfo struct {
-	Index    int
-	Term     int
-	IsLeader bool
-}
-
-// for do snapshot args
-type SnapshotArgs struct {
-	LastIncludedTerm  int
-	LastIncludedIndex int
-	Snapshot          []byte
-}
-
 // log entry
 type Entry struct {
 	Command interface{}
 	Term    int
 	Index   int
+}
+
+type ErrorEvent struct {
+	MType  MessageType
+	Server int
+	Term   int
 }

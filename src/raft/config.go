@@ -48,7 +48,7 @@ type config struct {
 	connected   []bool   // whether each server is on the net
 	saved       []*Persister
 	endnames    [][]string            // the port file names each sends to
-	logs        []map[int]interface{} // copy of each server's committed entries
+	logs        []map[int]interface{} // copy of each server's Committed entries
 	lastApplied []int
 	start       time.Time // time at which make_config() was called
 	// begin()/end() statistics
@@ -143,8 +143,8 @@ func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
 	for j := 0; j < len(cfg.logs); j++ {
 		if old, oldok := cfg.logs[j][m.CommandIndex]; oldok && old != v {
 			log.Printf("%v: log %v; server %v\n", i, cfg.logs[i], cfg.logs[j])
-			// some server has already committed a different value for this entry!
-			err_msg = fmt.Sprintf("committed index=%v server=%v %v != server=%v %v",
+			// some server has already Committed a different value for this entry!
+			err_msg = fmt.Sprintf("Committed index=%v server=%v %v != server=%v %v",
 				m.CommandIndex, i, m.Command, j, old)
 		}
 	}
@@ -492,7 +492,7 @@ func (cfg *config) checkNoLeader() {
 	}
 }
 
-// how many servers think a log entry is committed?
+// how many servers think a log entry is Committed?
 func (cfg *config) nCommitted(index int) (int, interface{}) {
 	count := 0
 	var cmd interface{} = nil
@@ -507,7 +507,7 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 
 		if ok {
 			if count > 0 && cmd != cmd1 {
-				cfg.t.Fatalf("committed values do not match: index %v, %v, %v",
+				cfg.t.Fatalf("Committed values do not match: index %v, %v, %v",
 					index, cmd, cmd1)
 			}
 			count += 1
@@ -517,7 +517,7 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 	return count, cmd
 }
 
-// wait for at least n servers to committed.
+// wait for at least n servers to Committed.
 // but don't wait forever.
 func (cfg *config) wait(index int, n int, startTerm int) interface{} {
 	to := 10 * time.Millisecond
@@ -590,7 +590,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
 				if nd > 0 && nd >= expectedServers {
-					// committed
+					// Committed
 					if cmd1 == cmd {
 						// and it was the command we submitted.
 						return index
