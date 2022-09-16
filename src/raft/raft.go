@@ -62,12 +62,6 @@ const (
 	Follower            = 1
 )
 
-var StateStringMap = map[RaftState]string{
-	Leader:    "Leader",
-	Candidate: "Candidate",
-	Follower:  "Follower",
-}
-
 const TickUnit = 5 * time.Millisecond
 const HBDeadlineBase = 15
 const ElecDeadlineBase = 40
@@ -93,13 +87,18 @@ type Raft struct {
 
 	nextIndex  []int
 	matchIndex []int
-	voteForMe  int
+	voteCount  int
+
+	hasNewEntry bool
 
 	recv    chan Message     // local call, rpc handle, rpc response handle
-	errC    chan ErrorEvent  // rpc call failed handle
+	errC    chan Message     // rpc call failed handle
 	tc      chan interface{} // lock event handle
 	applyCh chan ApplyMsg
 	closeCh chan interface{}
+
+	tickFunc func(rf *Raft)
+	stepFunc func(rf *Raft, msg Message) error
 
 	// local lock
 	elapsed  int
@@ -112,7 +111,7 @@ func (rf *Raft) GetState() (int, bool) {
 
 	// Your code here (2A).
 	ch := make(chan Message)
-	rf.recv <- Message{Type: GetState, Term: -1, replyC: ch}
+	rf.recv <- Message{MType: GetState, replyC: ch}
 	select {
 	case msg := <-ch:
 		return msg.Term, msg.Success
@@ -165,15 +164,6 @@ func (rf *Raft) readPersist(data []byte, sn []byte) {
 		rf.votedFor = voteFor
 		rf.rsm.Initialize(hardRsm, sn)
 	}
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
 }
 
 //
@@ -185,13 +175,18 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	// Your code here (2D).
 	ch := make(chan Message)
 	rf.recv <- Message{
-		Type:         CondInstallSnapshot,
-		LastLogIndex: lastIncludedIndex,
-		LastLogTerm:  lastIncludedTerm,
-		Snapshot:     snapshot,
-		replyC:       ch,
+		MType:    CondInstallSnapshot,
+		LogIndex: lastIncludedIndex,
+		LogTerm:  lastIncludedTerm,
+		Snapshot: snapshot,
+		replyC:   ch,
 	}
-	return (<-ch).Success
+	select {
+	case msg := <-ch:
+		return msg.Success
+	case <-rf.closeCh:
+		return false
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -202,13 +197,15 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	ch := make(chan Message)
 	rf.recv <- Message{
-		Type:         DoSnapshot,
-		LastLogIndex: index,
-		Term:         -1,
-		Snapshot:     snapshot,
-		replyC:       ch,
+		MType:    DoSnapshot,
+		LogIndex: index,
+		Snapshot: snapshot,
+		replyC:   ch,
 	}
-	<-ch
+	select {
+	case <-ch:
+	case <-rf.closeCh:
+	}
 }
 
 //
@@ -240,12 +237,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	ch := make(chan Message)
 	rf.recv <- Message{
-		Type:         VoteRequest,
-		From:         args.CandidateId,
-		LastLogIndex: args.LastLogIndex,
-		LastLogTerm:  args.LastLogTerm,
-		Term:         args.Term,
-		replyC:       ch,
+		MType:    VoteRequest,
+		Server:   args.CandidateId,
+		LogIndex: args.LastLogIndex,
+		LogTerm:  args.LastLogTerm,
+		Term:     args.Term,
+		replyC:   ch,
 	}
 	select {
 	case msg := <-ch:
@@ -292,7 +289,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) requestVoteLoop(server int) {
-	lastEntry, _ := rf.rsm.LastEntry()
+	lastEntry := rf.rsm.LastEntry()
 	arg := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
@@ -304,13 +301,13 @@ func (rf *Raft) requestVoteLoop(server int) {
 		ok := rf.sendRequestVote(server, arg, reply)
 		if ok {
 			rf.recv <- Message{
-				Type:    VoteResponse,
-				From:    server,
+				MType:   VoteResponse,
+				Server:  server,
 				Term:    reply.Term,
 				Success: reply.VoteGranted,
 			}
 		} else {
-			rf.errC <- ErrorEvent{MType: VoteRequest, Server: server, Term: arg.Term}
+			rf.errC <- Message{MType: VoteRequest, Server: server, Term: arg.Term}
 		}
 	}()
 }
@@ -335,10 +332,10 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	ch := make(chan Message)
 	rf.recv <- Message{
-		Type:         AppendRequest,
-		From:         args.LeaderId,
-		LastLogIndex: args.PrevLogIndex,
-		LastLogTerm:  args.PrevLogTerm,
+		MType:        AppendRequest,
+		Server:       args.LeaderId,
+		LogIndex:     args.PrevLogIndex,
+		LogTerm:      args.PrevLogTerm,
 		Term:         args.Term,
 		Entries:      args.Entries,
 		LeaderCommit: args.LeaderCommit,
@@ -348,8 +345,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	case msg := <-ch:
 		reply.Term = msg.Term
 		reply.Success = msg.Success
-		reply.LastLogIndex = msg.LastLogIndex
-		reply.LastLogTerm = msg.LastLogTerm
+		reply.LastLogIndex = msg.LogIndex
+		reply.LastLogTerm = msg.LogTerm
 		return
 	case <-rf.closeCh:
 		return
@@ -372,22 +369,22 @@ func (rf *Raft) appendEntriesLoop(server int) {
 		PrevLogIndex: prevIndex,
 		PrevLogTerm:  prevTerm,
 		Entries:      entries,
-		LeaderCommit: rf.rsm.CommitIndex(),
+		LeaderCommit: rf.rsm.committed,
 	}
 	reply := &AppendEntriesReply{}
 	go func() {
 		ok := rf.sendAppendEntries(server, args, reply)
 		if ok {
 			rf.recv <- Message{
-				Type:         AppendResponse,
-				From:         server,
-				Term:         reply.Term,
-				LastLogIndex: reply.LastLogIndex,
-				LastLogTerm:  reply.LastLogTerm,
-				Success:      reply.Success,
+				MType:    AppendResponse,
+				Server:   server,
+				Term:     reply.Term,
+				LogIndex: reply.LastLogIndex,
+				LogTerm:  reply.LastLogTerm,
+				Success:  reply.Success,
 			}
 		} else {
-			rf.errC <- ErrorEvent{MType: AppendRequest, Server: server, Term: args.Term}
+			rf.errC <- Message{MType: AppendRequest, Server: server, Term: args.Term}
 		}
 	}()
 }
@@ -408,16 +405,19 @@ type InstallSnapshotReply struct {
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	ch := make(chan Message)
 	rf.recv <- Message{
-		Type:         InstallSnapshotRequest,
-		From:         args.LeaderId,
-		Term:         args.Term,
-		LastLogIndex: args.LastIncludedIndex,
-		LastLogTerm:  args.LastIncludedTerm,
-		Snapshot:     args.Snapshot,
+		MType:    InstallSnapshotRequest,
+		Server:   args.LeaderId,
+		Term:     args.Term,
+		LogIndex: args.LastIncludedIndex,
+		LogTerm:  args.LastIncludedTerm,
+		Snapshot: args.Snapshot,
 	}
-	msg := <-ch
-	reply.Term = msg.Term
-	reply.LastLogIndex = msg.LastLogIndex
+	select {
+	case msg := <-ch:
+		reply.Term = msg.Term
+		reply.LastLogIndex = msg.LogIndex
+	case <-rf.closeCh:
+	}
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
@@ -443,14 +443,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	rc := make(chan Message)
 	rf.recv <- Message{
-		Type:   AppendCommand,
+		MType:  AppendCommand,
 		Val:    command,
-		Term:   -1,
 		replyC: rc,
 	}
-	msg := <-rc
-
-	return msg.LastLogIndex, msg.LastLogTerm, msg.Success
+	select {
+	case msg := <-rc:
+		return msg.LogIndex, msg.LogTerm, msg.Success
+	case <-rf.closeCh:
+		return -1, -1, false
+	}
 }
 
 //
@@ -495,7 +497,7 @@ func (rf *Raft) mainLoop() {
 	for rf.killed() == false {
 		select {
 		case <-rf.tc:
-			rf.handleTick()
+			rf.tickFunc(rf)
 		case msg := <-rf.recv:
 			err := rf.stepMessage(msg)
 			if err != nil {
@@ -516,151 +518,45 @@ func (rf *Raft) apply(applyCh chan ApplyMsg) {
 	}
 }
 
-func (rf *Raft) stepMessage(msg Message) error {
-	if msg.Term == -1 {
-		// local message
-		rf.stepLocalMessage(msg)
-		return nil
-	} else if msg.Term < rf.currentTerm {
-		rf.reject(msg)
-		return nil
-	} else if msg.Term > rf.currentTerm {
-		rf.becomeFollower(msg.Term)
-	}
-
-	// always msg.Term == rf.currentTerm
-	if msg.Type == AppendRequest && rf.state == Candidate {
-		rf.becomeFollower(msg.Term)
-	}
-
-	switch rf.state {
-	case Follower:
-		return rf.stepFollower(msg)
-	case Candidate:
-		return rf.stepCandidate(msg)
-	case Leader:
-		return rf.stepLeader(msg)
-	default:
-		return errors.New("unexcepted raft state")
-	}
-}
-
-func (rf *Raft) stepFollower(msg Message) error {
-	switch msg.Type {
-	case VoteRequest:
-		if rf.votedFor == -1 && !rf.rsm.UpToDate(msg.LastLogTerm, msg.LastLogIndex) {
-			//DPrintf("server %v vote for %v in term %v", rf.me, msg.From, rf.currentTerm)
-			rf.voteForOther(msg.From)
-			msg.replyC <- Message{Type: VoteResponse, Term: rf.currentTerm, Success: true}
-		} else {
-			rf.reject(msg)
-		}
-		return nil
-	case VoteResponse:
-		return nil
-	case AppendRequest:
-		rf.elapsed = 0
-		ok, lastIndex := rf.rsm.Compact(msg.LastLogTerm, msg.LastLogIndex, msg.Entries)
-		if !ok {
-			msg.replyC <- Message{Term: rf.currentTerm, Success: false}
-		} else {
-			mayCommit := Min(msg.LeaderCommit, lastIndex)
-			if rf.rsm.Commit(mayCommit) {
-				rf.elapsed = rf.deadline
-				DPrintf("follower %v commit to %v", rf.me, mayCommit)
-			}
-			rf.persist()
-			msg.replyC <- Message{Term: rf.currentTerm, Success: true, LastLogIndex: lastIndex}
-		}
-		return nil
-	case AppendResponse:
-		// pass
-		return nil
-	default:
-		return nil
-	}
-}
-
-func (rf *Raft) voteForOther(server int) {
+func (rf *Raft) vote(server int) {
 	rf.votedFor = server
 	rf.persist()
 	// reset local lock
 	rf.elapsed = 0
 }
 
-func (rf *Raft) stepLeader(msg Message) error {
-	switch msg.Type {
-	case VoteRequest:
-		rf.reject(msg)
+func (rf *Raft) stepMessage(msg Message) error {
+	if msg.Term == 0 {
+		// localMessage
+		rf.stepLocalMessage(msg)
 		return nil
-	case VoteResponse:
-		// pass, do nothing
-		return nil
-	case AppendResponse:
-		if msg.Success {
-			rf.matchIndex[msg.From] = Max(rf.matchIndex[msg.From], msg.LastLogIndex)
-			rf.nextIndex[msg.From] = rf.matchIndex[msg.From] + 1
-			// raft commit rule 5.3, 5.4
-			maybeCommit := Majority(rf.matchIndex)
-			entry, err := rf.rsm.EntryAt(maybeCommit)
-			if err != nil {
-				return errors.New(fmt.Sprintf("leader %v has not entry exists in %v", rf.me, maybeCommit))
-			}
-			if entry.Term == rf.currentTerm {
-				if rf.rsm.Commit(maybeCommit) {
-					DPrintf("leader %v commit to %v", rf.me, maybeCommit)
-				}
-			}
-		} else {
-			rf.nextIndex[msg.From] -= 1
-			if rf.nextIndex[msg.From] == rf.matchIndex[msg.From] {
-				return errors.New(fmt.Sprintf("invalid state for server %v: [%v, %v]", msg.From,
-					rf.matchIndex[msg.From], rf.nextIndex[msg.From]))
-			}
-			rf.appendEntriesLoop(msg.From)
-		}
-		return nil
-	default:
-		return errors.New(fmt.Sprintf("unexcepted msgType [%s] for Leader", MessageTypeMap[msg.Type]))
 	}
-}
 
-func (rf *Raft) stepCandidate(msg Message) error {
-	switch msg.Type {
-	case VoteRequest:
+	if msg.Term > rf.currentTerm {
+		rf.becomeFollower(msg.Term)
+	} else if msg.Term < rf.currentTerm {
 		rf.reject(msg)
 		return nil
-	case VoteResponse:
-		if msg.Success {
-			rf.voteForMe += 1
-			if rf.voteForMe > len(rf.peers)/2 {
-				rf.becomeLeader()
-			}
-		}
-		return nil
-	default:
-		return errors.New(fmt.Sprintf("unexcepted msgType [%s] for Candidate", MessageTypeMap[msg.Type]))
 	}
+
+	if msg.MType == AppendRequest && rf.state == Candidate {
+		rf.becomeFollower(msg.Term)
+	}
+
+	return rf.stepFunc(rf, msg)
 }
 
 func (rf *Raft) stepLocalMessage(msg Message) {
-	switch msg.Type {
+	switch msg.MType {
 	case AppendCommand:
 		if rf.state == Leader {
 			logIndex := rf.rsm.Append(rf.currentTerm, msg.Val)
 			rf.persist()
+			rf.hasNewEntry = true
 			rf.matchIndex[rf.me] = logIndex
-			msg.replyC <- Message{
-				LastLogIndex: logIndex,
-				LastLogTerm:  rf.currentTerm,
-				Success:      true,
-			}
+			msg.replyC <- Message{LogIndex: logIndex, LogTerm: rf.currentTerm, Success: true}
 		} else {
-			msg.replyC <- Message{
-				LastLogIndex: -1,
-				LastLogTerm:  -1,
-				Success:      false,
-			}
+			msg.replyC <- Message{Success: false}
 		}
 		break
 	case GetState:
@@ -674,12 +570,12 @@ func (rf *Raft) stepLocalMessage(msg Message) {
 	case CondInstallSnapshot:
 		break
 	default:
-		log.Fatalf("unexcepted message type: [%s] for local message", MessageTypeMap[msg.Type])
+		log.Fatalf("unexcepted message type: [%s] for local message", MessageTypeMap[msg.MType])
 	}
 }
 
 func (rf *Raft) reject(msg Message) {
-	if msg.Type == VoteRequest || msg.Type == AppendRequest || msg.Type == InstallSnapshotRequest {
+	if msg.MType == VoteRequest || msg.MType == AppendRequest || msg.MType == InstallSnapshotRequest {
 		msg.replyC <- Message{
 			Term:    rf.currentTerm,
 			Success: false,
@@ -688,47 +584,24 @@ func (rf *Raft) reject(msg Message) {
 	// response ignore
 }
 
-func (rf *Raft) handleError(event ErrorEvent) {
-	if event.Term == rf.currentTerm {
-		if event.MType == VoteRequest && rf.state == Candidate {
-			rf.requestVoteLoop(event.Server)
+func (rf *Raft) handleError(msg Message) {
+	if msg.Term == rf.currentTerm {
+		if msg.MType == VoteRequest && rf.state == Candidate {
+			rf.requestVoteLoop(msg.Server)
 		}
-		if event.MType == AppendRequest && rf.state == Leader {
-			rf.appendEntriesLoop(event.Server)
+		if msg.MType == AppendRequest && rf.state == Leader {
+			rf.appendEntriesLoop(msg.Server)
 		}
 	}
 }
 
-func (rf *Raft) handleTick() {
-	rf.elapsed += 1
-	if rf.elapsed >= rf.deadline {
-		switch rf.state {
-		case Follower:
-			rf.becomeCandidate()
-			rf.startElection()
-			break
-		case Candidate:
-			rf.becomeCandidate()
-			rf.startElection()
-			break
-		case Leader:
-			rf.heartbeat()
-			break
-		}
-		rf.elapsed = 0
-		return
-	}
-	if rf.state == Leader && rf.rsm.hasUncommitted() {
-		rf.heartbeat()
-	}
-}
-
-func (rf *Raft) heartbeat() {
+func (rf *Raft) doHeartbeat() {
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			rf.appendEntriesLoop(i)
 		}
 	}
+	rf.elapsed = 0
 }
 
 func (rf *Raft) startElection() {
@@ -744,26 +617,34 @@ func (rf *Raft) becomeLeader() {
 	rf.state = Leader
 	rf.deadline = rand.Intn(HBDeadlineBase) + HBDeadlineBase
 	rf.elapsed = rf.deadline
-	lastEntry, _ := rf.rsm.LastEntry()
+
+	lastEntry := rf.rsm.LastEntry()
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			rf.matchIndex[i] = 0
-			rf.nextIndex[i] = lastEntry.Index + 1
 		} else {
 			rf.matchIndex[i] = lastEntry.Index
-			rf.nextIndex[i] = lastEntry.Index + 1
 		}
+		rf.nextIndex[i] = lastEntry.Index + 1
 	}
+
+	rf.tickFunc = leaderTick
+	rf.stepFunc = stepLeader
 }
 
 func (rf *Raft) becomeCandidate() {
-	//DPrintf("server %v become candidate in term %v", rf.me, rf.currentTerm+1)
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
-	rf.voteForMe = 1
+	rf.voteCount = 1
 	rf.persist()
+
 	rf.state = Candidate
 	rf.deadline = rand.Intn(ElecDeadlineBase) + ElecDeadlineBase
+	rf.elapsed = 0
+	rf.tickFunc = candidateTick
+	rf.stepFunc = stepCandidate
+
+	rf.startElection()
 }
 
 func (rf *Raft) becomeFollower(term int) {
@@ -772,10 +653,13 @@ func (rf *Raft) becomeFollower(term int) {
 		rf.votedFor = -1
 		rf.persist()
 	}
-	rf.voteForMe = 0
+
 	rf.state = Follower
 	rf.deadline = rand.Intn(ElecDeadlineBase) + ElecDeadlineBase
 	rf.elapsed = 0
+
+	rf.tickFunc = followerTick
+	rf.stepFunc = stepFollower
 }
 
 //
@@ -812,10 +696,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 
-	rf.recv = make(chan Message, 100)
-	rf.errC = make(chan ErrorEvent, 100)
-	rf.tc = make(chan interface{}, 100)
-	rf.applyCh = make(chan ApplyMsg, 100)
+	rf.recv = make(chan Message, 128)
+	rf.errC = make(chan Message, 128)
+	rf.tc = make(chan interface{}, 128)
+	rf.applyCh = make(chan ApplyMsg, 128)
 	rf.closeCh = make(chan interface{})
 
 	// initialize from state persisted before a crash
@@ -828,4 +712,105 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.apply(applyCh)
 
 	return rf
+}
+
+func followerTick(rf *Raft) {
+	rf.elapsed++
+	if rf.elapsed > rf.deadline {
+		rf.becomeCandidate()
+	}
+}
+
+func candidateTick(rf *Raft) {
+	rf.elapsed++
+	if rf.elapsed > rf.deadline {
+		rf.becomeCandidate()
+	}
+}
+
+func leaderTick(rf *Raft) {
+	rf.elapsed++
+	if rf.hasNewEntry || rf.elapsed >= rf.deadline {
+		rf.doHeartbeat()
+		rf.hasNewEntry = false
+	}
+}
+
+func stepLeader(rf *Raft, msg Message) error {
+	switch msg.MType {
+	case AppendResponse:
+		if msg.Success {
+			if msg.LogIndex > rf.matchIndex[msg.Server] {
+				rf.matchIndex[msg.Server] = msg.LogIndex
+				rf.nextIndex[msg.Server] = msg.LogIndex + 1
+				mayCommit := Majority(rf.matchIndex)
+				e, err := rf.rsm.EntryAt(mayCommit)
+				if err != nil && e.Term == rf.currentTerm && rf.rsm.Commit(mayCommit) {
+					rf.doHeartbeat()
+				}
+			}
+		} else {
+			rf.nextIndex[msg.Server] -= 1
+			rf.appendEntriesLoop(msg.Server)
+		}
+		break
+	case VoteRequest, VoteResponse:
+		break
+	default:
+		return errors.New(fmt.Sprintf("unsupported msg type [%v] for leader", MessageTypeMap[msg.MType]))
+	}
+	return nil
+}
+
+func stepFollower(rf *Raft, msg Message) error {
+	switch msg.MType {
+	case VoteRequest:
+		if rf.votedFor == -1 && !rf.rsm.UpToDate(msg.LogTerm, msg.LogIndex) {
+			rf.vote(msg.Server)
+			msg.replyC <- Message{Success: true, Term: rf.currentTerm}
+		} else {
+			rf.reject(msg)
+		}
+		break
+	// transfer from follower
+	case VoteResponse:
+		break
+	case AppendRequest:
+		rf.elapsed = 0
+		ok, lastIndex := rf.rsm.Compact(msg.LogTerm, msg.LogIndex, msg.Entries)
+		if ok {
+			msg.replyC <- Message{Success: true, LogIndex: lastIndex, Term: rf.currentTerm}
+			mayCommitIndex := Min(msg.LeaderCommit, lastIndex)
+			rf.rsm.Commit(mayCommitIndex)
+		} else {
+			msg.replyC <- Message{Success: false, Term: rf.currentTerm}
+		}
+		break
+	// transfer from leader and receive new response
+	case AppendResponse:
+		break
+	default:
+		return errors.New(fmt.Sprintf("unsupported msg type [%v] for follower", MessageTypeMap[msg.MType]))
+	}
+	return nil
+}
+
+func stepCandidate(rf *Raft, msg Message) error {
+	switch msg.MType {
+	case VoteRequest:
+		rf.reject(msg)
+		break
+	case VoteResponse:
+		if msg.Success {
+			rf.voteCount += 1
+			rf.elapsed = 0
+			if rf.voteCount > len(rf.peers)/2 {
+				rf.becomeLeader()
+			}
+		}
+		break
+	default:
+		return errors.New(fmt.Sprintf("unsupported msg type [%v] for candidate", MessageTypeMap[msg.MType]))
+	}
+	return nil
 }

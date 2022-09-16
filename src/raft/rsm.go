@@ -29,7 +29,6 @@ func (rsm *Rsm) Initialize(hardRsm HardRsm, sn []byte) {
 
 var IndexOutBoundError = errors.New("index out of bound")
 var UnmatchArgumentError = errors.New("unmatch argument error")
-var EntryValueForgottenError = errors.New("entry forgotten")
 
 func (rsm *Rsm) EntryAt(index int) (Entry, error) {
 	if index < rsm.logs[0].Index || index > rsm.logs[len(rsm.logs)-1].Index {
@@ -40,7 +39,7 @@ func (rsm *Rsm) EntryAt(index int) (Entry, error) {
 }
 
 func (rsm *Rsm) EntryFrom(start, limit int) ([]Entry, int, int, error) {
-	lastEntry, _ := rsm.LastEntry()
+	lastEntry := rsm.LastEntry()
 	firstIndex := rsm.logs[0].Index
 	if start <= firstIndex {
 		return nil, -1, -1, IndexOutBoundError
@@ -48,45 +47,22 @@ func (rsm *Rsm) EntryFrom(start, limit int) ([]Entry, int, int, error) {
 	if start > lastEntry.Index {
 		return nil, lastEntry.Term, lastEntry.Index, nil
 	} else {
-		ents := make([]Entry, Max(lastEntry.Index-firstIndex+1, limit))
+		ents := make([]Entry, Min(lastEntry.Index-start+1, limit))
 		copy(ents, rsm.logs[start-firstIndex:])
 		return ents, rsm.logs[start-firstIndex-1].Term, rsm.logs[start-firstIndex-1].Index, nil
 	}
 }
 
 func (rsm *Rsm) hasUncommitted() bool {
-	lastEntry, _ := rsm.LastEntry()
+	lastEntry := rsm.LastEntry()
 	return lastEntry.Index > rsm.committed
 }
 
 func (rsm *Rsm) UpToDate(otherTerm int, otherIndex int) bool {
-	lastEntry, _ := rsm.LastEntry()
+	lastEntry := rsm.LastEntry()
 	return lastEntry.Term > otherTerm ||
 		(lastEntry.Term == otherTerm && lastEntry.Index > otherIndex)
 }
-
-func (rsm *Rsm) CommitIndex() int {
-	return rsm.committed
-}
-
-func (rsm *Rsm) AppliedIndex() int {
-	return rsm.applied
-}
-
-// drop log from given start index, only uncommited
-//func (rsm *Rsm) Drop(index int) error {
-//	if index <= rsm.committed {
-//		return IndexOutBoundError
-//	}
-//
-//	e, _ := rsm.LastEntry()
-//	if index > e.Index {
-//		return IndexOutBoundError
-//	}
-//	startIndex := index - rsm.logs[0].Index
-//	rsm.logs = rsm.logs[:startIndex]
-//	return nil
-//}
 
 func (rsm *Rsm) Compact(prevTerm, prevIndex int, entries []Entry) (bool, int) {
 	entry, err := rsm.EntryAt(prevIndex)
@@ -138,16 +114,13 @@ func (rsm *Rsm) Commit(committed int) bool {
 	return true
 }
 
-func (rsm *Rsm) LastEntry() (Entry, error) {
-	if len(rsm.logs) == 1 {
-		return rsm.logs[0], EntryValueForgottenError
-	}
-	return rsm.logs[len(rsm.logs)-1], nil
+func (rsm *Rsm) LastEntry() Entry {
+	return rsm.logs[len(rsm.logs)-1]
 }
 
 // append log entry at tail
 func (rsm *Rsm) Append(term int, command interface{}) int {
-	e, _ := rsm.LastEntry()
+	e := rsm.LastEntry()
 	rsm.logs = append(rsm.logs, Entry{
 		Command: command,
 		Term:    term,
@@ -162,7 +135,7 @@ func (rsm *Rsm) AppendEntries(entries []Entry) error {
 	}
 
 	first := entries[0]
-	last, _ := rsm.LastEntry()
+	last := rsm.LastEntry()
 	if first.Index != last.Index+1 {
 		return UnmatchArgumentError
 	}

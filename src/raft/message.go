@@ -42,27 +42,24 @@ func (m MessageType) String() string {
 }
 
 type Message struct {
-	Type MessageType "message type"
-	Id   uint64      "message id"
-	From int         "what peer the message from"
-	To   int         "what peer the message will sent"
+	MType  MessageType
+	Id     uint64
+	Server int
+	Term   int
 
-	LastLogIndex int
-	LastLogTerm  int
+	Success      bool
+	LogIndex     int
+	LogTerm      int
 	LeaderCommit int
 	Entries      []Entry
 	Snapshot     []byte
-
-	Val interface{}
-
-	Term    int "message term"
-	Success bool
+	Val          interface{}
 
 	replyC chan Message
 }
 
 func (m *Message) String() string {
-	str := MessageTypeMap[m.Type] + "["
+	str := MessageTypeMap[m.MType] + "["
 	b, err := json.Marshal(m)
 	if err != nil {
 		log.Fatalln(err)
@@ -77,10 +74,4 @@ type Entry struct {
 	Command interface{}
 	Term    int
 	Index   int
-}
-
-type ErrorEvent struct {
-	MType  MessageType
-	Server int
-	Term   int
 }
