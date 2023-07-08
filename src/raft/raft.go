@@ -425,6 +425,29 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 	return ok
 }
 
+func (rf *Raft) installSnapshotLoop(server int) {
+	args := &InstallSnapshotArgs{
+		Term:              rf.currentTerm,
+		LeaderId:          rf.me,
+		LastIncludedIndex: rf.rsm.logs[0].Index,
+		LastIncludedTerm:  rf.rsm.logs[0].Term,
+		Snapshot:          rf.rsm.sn,
+	}
+	reply := &InstallSnapshotReply{}
+	go func() {
+		if ok := rf.sendInstallSnapshot(server, args, reply); ok {
+			rf.recv <- Message{
+				MType:    InstallSnapshotResponse,
+				Server:   server,
+				Term:     reply.Term,
+				LogIndex: reply.LastLogIndex,
+			}
+		} else {
+			rf.errC <- Message{Server: server, Term: reply.Term}
+		}
+	}()
+}
+
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -539,7 +562,7 @@ func (rf *Raft) stepMessage(msg Message) error {
 		return nil
 	}
 
-	if msg.MType == AppendRequest && rf.state == Candidate {
+	if (msg.MType == AppendRequest || msg.MType == InstallSnapshotRequest) && rf.state == Candidate {
 		rf.becomeFollower(msg.Term)
 	}
 
@@ -566,8 +589,19 @@ func (rf *Raft) stepLocalMessage(msg Message) {
 		}
 		break
 	case DoSnapshot:
+		err := rf.rsm.Forgotten(msg.LogIndex, msg.Snapshot)
+		if err != nil {
+			log.Fatalln("do snapshot index > applied index")
+		}
+		msg.replyC <- Message{}
 		break
 	case CondInstallSnapshot:
+		err := rf.rsm.Forgotten(msg.LogIndex, msg.Snapshot)
+		if err != nil {
+			msg.replyC <- Message{Success: false}
+		} else {
+			msg.replyC <- Message{Success: true}
+		}
 		break
 	default:
 		log.Fatalf("unexcepted message type: [%s] for local message", MessageTypeMap[msg.MType])
@@ -745,13 +779,22 @@ func stepLeader(rf *Raft, msg Message) error {
 				rf.nextIndex[msg.Server] = msg.LogIndex + 1
 				mayCommit := Majority(rf.matchIndex)
 				e, err := rf.rsm.EntryAt(mayCommit)
-				if err != nil && e.Term == rf.currentTerm && rf.rsm.Commit(mayCommit) {
+				if err != nil {
+					log.Fatalln("commit no entry")
+				}
+				if e.Term == rf.currentTerm && rf.rsm.Commit(mayCommit) {
 					rf.doHeartbeat()
 				}
 			}
 		} else {
 			rf.nextIndex[msg.Server] -= 1
 			rf.appendEntriesLoop(msg.Server)
+		}
+		break
+	case InstallSnapshotResponse:
+		if msg.LogIndex > rf.matchIndex[msg.Server] {
+			rf.matchIndex[msg.Server] = msg.LogIndex
+			rf.nextIndex[msg.Server] = msg.LogIndex + 1
 		}
 		break
 	case VoteRequest, VoteResponse:
@@ -772,9 +815,6 @@ func stepFollower(rf *Raft, msg Message) error {
 			rf.reject(msg)
 		}
 		break
-	// transfer from follower
-	case VoteResponse:
-		break
 	case AppendRequest:
 		rf.elapsed = 0
 		ok, lastIndex := rf.rsm.Compact(msg.LogTerm, msg.LogIndex, msg.Entries)
@@ -786,8 +826,18 @@ func stepFollower(rf *Raft, msg Message) error {
 			msg.replyC <- Message{Success: false, Term: rf.currentTerm}
 		}
 		break
+	case InstallSnapshotRequest:
+		rf.elapsed = 0
+		rf.applyCh <- ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      msg.Snapshot,
+			SnapshotTerm:  msg.LogTerm,
+			SnapshotIndex: msg.LogIndex,
+		}
+		msg.replyC <- Message{Term: rf.currentTerm, LogIndex: msg.LogIndex}
+		break
 	// transfer from leader and receive new response
-	case AppendResponse:
+	case VoteResponse, AppendResponse, InstallSnapshotResponse:
 		break
 	default:
 		return errors.New(fmt.Sprintf("unsupported msg type [%v] for follower", MessageTypeMap[msg.MType]))

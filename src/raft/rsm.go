@@ -94,6 +94,9 @@ func (rsm *Rsm) Forgotten(index int, sn []byte) error {
 	if index > rsm.applied {
 		return IndexOutBoundError
 	}
+	if index <= rsm.logs[0].Index {
+		return nil
+	}
 
 	startIndex := index - rsm.logs[0].Index
 	rsm.logs = rsm.logs[startIndex:]
