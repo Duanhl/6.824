@@ -60,7 +60,7 @@ type Raft struct {
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
+	ch chan Msg
 }
 
 // return currentTerm and whether this server
